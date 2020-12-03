@@ -73,3 +73,9 @@ ourShader.setInt("texture2", 1); // 或者使用着色器类设置
 * 最简单的变换矩阵就是单位矩阵(Identity Matrix)。单位矩阵是一个除了对角线以外都是0的N×N矩阵。在下式中可以看到，这种变换矩阵使一个向量完全不变：
 * 几个常见的矩阵，旋转，平移，缩放等`https://learnopengl-cn.github.io/01%20Getting%20started/07%20Transformations/`
 * ![avatar](vectors_addition.png)![avatar](vectors_subtraction.png)![avatar](vectors_triangle.png)
+* 向量叉乘
+* ![avatar](impicture_20201203_211108.png)
+* 旋转矩阵
+* ![avatar](impicture_20201203_211144.png)
+* 一个平移矩阵
+* ![avatar](impicture_20201203_211157.png)
