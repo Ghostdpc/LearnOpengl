@@ -219,5 +219,7 @@ GPU实现了概念上的图形处理，光栅化，像素处理，这部分流�
 
 在最开始，输入到hull shader的输入时一个特殊的图元patch，这部分是由一部分定义了细分表面的控制点，Bezier patch ，或者其他类型的曲边元。Hull shader有两个功能，首先，它告诉了tessellator有多少三角形需要被生成，并且它们的设置是什么。然后，它再每一个控制点上都开始执行操作。hull shader也能修改传入的patch的描述，按照预期添加或删除控制点。hull shader输出它的控制点集和tessellation control data 给下一步的domain shader
 
-.
+tessellator 是渲染管线中固定功能的一个阶段，它只会在tessellation着色器中使用。它的任务是添加一部分新的顶点给domain shader使用。Hull Shader 会传递关于需要怎样的镶嵌表面类型的tessellator信息，例如三角形，等值线，四边形等。等值线是一组线条组，有的时候会被用来做毛发渲染。另外一个hull shader所传递的重要信息则是tessellation factors（在opgl里面是tessellation levels）。他有两种类型，内外边缘。outer factor 确定每个外边缘的分割程度 ，而inner factor 则确定多少镶嵌操作在三角形或者四边形中发生。一个提高tessellation factors 的例子在图3.10中表现了。通过独立的控制，我们可以调整曲面的表面来匹配镶嵌，而不管内部是怎么镶嵌的。边缘匹配避免了裂缝或者xxx.顶点被指定重心坐标，它是指定所需表面上每个点的相对位置的值  
+
+![3.10](.\3.10.png)
 
