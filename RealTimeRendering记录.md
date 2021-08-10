@@ -723,9 +723,8 @@ $$
 **四元数运算遵循的一些规则**:
 
 共轭规则:
-$$
-1
-$$
+
+![gongshi436](./gongshi436.png)
 
 > 用语言描述则是
 >
@@ -734,9 +733,8 @@ $$
 > 3. 两个四元数乘积的共轭是它们共轭调换顺序后的乘积。
 
 模规则:
-$$
-2
-$$
+
+![gongshi437](./gongshi437.png)
 
 > 用文字语言描述即：
 >
@@ -744,15 +742,36 @@ $$
 > 2.  两个四元数乘积的模等于它们模的乘积
 
 乘法法则:
-$$
-3
-$$
+
 Linearity规则:
+
+![gongshi438](./gongshi438.png)
+
+Associativity:
 $$
-4
+\hat{p}(\hat{q}\hat{r}) = (\hat{p}\hat{q})\hat{r}
 $$
+
+
 **单位四元数**(unit quaternion)
 
-。。。。。。。。。
+模为1的四元数为单位四元数，即单位四元数$\hat{q}=(\hat{q}_v,\hat{q}_w),n(\hat{q}) = 1$,从而可以推导出$\hat{q}$可以写作
+
+![gongshi439](./gongshi439.png)
+
+其中 $u_q$ 是某个三维向量，且 $\abs{\abs{u_q}}=1$。因为当且仅当 $\abs{\abs{u_q}}=1$时，
+
+![公式](./gongshi440.png)
+
+其实单位四元数(unit quaternions)非常适合创建旋转(rotations)和定向(orientations)，效率较高，见[下文](https://zhuanlan.zhihu.com/p/97186723/edit#t2)。或下一章节
+
+对于复数，一个二维单位向量(unity vector)可以写作  。对于四元数等价的有:
+
+![公式](./gongshi441.png)
+
+四元数对数和指数函数:
+
+![gongshi442](./gongshi442.png)
 
 ### 4.3.2 四元数变换(Quaternion Transforms)
+
