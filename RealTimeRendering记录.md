@@ -843,7 +843,66 @@ $$
 
 **球面线性插值(Spherical Linear Interpolation)**
 
+球面线性插值是一个操作，即给定两个单位四元数 $\hat{q}$​ 和  $\hat{r}$以及一个参数  ，$t\in[0,1]$插值得到一个新的四元数。这可用于animating objects等。但这对于插值相机朝向(camera orientations)没有用处，因为相机的上向量(up vector)可能在插值是变倾斜。
 
+这个操作的代数形式被表达为一个复合四元数 $\hat{s}$ :
+$$
+\hat{s}(\hat{q},\hat{r},\hat{t}) = (\hat{r}\hat{q}^{-1})^t\hat{q}
+$$
+然而，为了软件实现，下面的形式更为合适(*slerp*表示spherical linear interpolation):
+
+![gongshi](./gongshi453.png)
+
+其中 $\cos{\phi}= q_xr_x+q_yr_y+q_zr_z+q_wr_W$ 。
+
+在 $t \in [0,1]$​ 内，slerp函数插值得到的一系列四元数一起组成了一个四维单位球上从  $\hat{q}(t=0)$​到$\hat{r}(t=1)$​  的最短弧(the shortes arc)。这个最短弧位于一个圆(circle)上，而这个圆是由  以及$\hat{q},\hat{r}$​原点组成的平面(plane)与这个四维单位球的交集(intersection)构成，如图4.10所示（用slerp对 q,r插值，其中$t\in[0,1]$​得到就是$\hat{q}$和$\hat{r}$之间的弧线)。计算得到的旋转四元数绕固定的轴以恒定的速度旋转。
+
+> 一个球上的[大圆](https://link.zhihu.com/?target=https%3A//en.wikipedia.org/wiki/Great_circle)(greate circle)由过圆心的平面和角相交产生。而大圆的一部分称为[great arc](https://link.zhihu.com/?target=https%3A//en.wikipedia.org/wiki/Great-circle_distance)(大弧？)，是指从球面一点A到另一点B，所经过的**最短**路径。
+> 大圆就是半径和球的半径一样的圆。
+
+![fig410](./fig410bigsphere.png)
+
+函数slerp非常适合在两个orientations间进行插值，并且表现得很好(固定的轴，恒定的速度)。
+
+当多于两个方向(orientatiosns)时，比如说有n个四元数 $\hat{q}_0...\hat{q}_{n-1},$​​ 可用，我们想要从  $\hat{q}_0$​​插值到$\hat{q}_1$​​ 再插值直到  $\hat{q}_{n-1}$​​，可以简单直接地使用slerp函数。比如说，当前到达 $\hat{q}_i$​​，则我们需要使用$\hat{q}_{i-1}$​​  和 $\hat{q}_i$​​ 作为slerp的参数*。*通过$\hat{q}_i$​​  后*，*需要使用$\hat{q}_{i}$​​  和 $\hat{q}_{i+1}$​​ 作为slerp的参数。这样插值多点四元数(orientations)会造成突变(jerks)，比如图4.10中插值$\hat{q}_1,\hat{q}_2,\hat{q}_3$可以看到 $\hat{q}_2$处有个明显的拐角(“突变”，不连续的变化)。这和对一系列点(points)进行插值相似，得到不是光滑的曲线，而是有显示拐点的折线。
+
+一个更好的方法是用某种样条曲线(spline)插值。我们在$\hat{q}_i,\hat{q}_{i+1}$ 之间引入 $\hat{a}_i,\hat{a}_{i+1}$  。球面三次插值(Spherical cubic interpolation)可定义在  上$\hat{q}_i,\hat{a}_i,\hat{a}_{i+1},\hat{q}_{i+1}$面。引入的这两个额外的四元数可以这样计算:
+
+![gongshi](./gongshi454.png)
+
+四元数 $\hat{q}_i,\hat{a}_i$ 将被用光滑的三次样条球形地插值:
+
+> The $\hat{q}_i,\hat{a}_i$  will be used to spherically interpolate the quaternions using a smooth cubic spine.
+
+![gongshi](./gongshi455.png)
+
+可以看到squad函数是由重复使用球形插值slerp得到的。
+
+> The interpolation will pass through the initial orientations $\hat{q}_i,i\in[0,...,n-1]$ , but not throught  $\hat{a}_i$--these are used to indicate the tangent orientations at the initial orientations.
+
+**从一个向量旋转到另一个向量)Rotation from One Vector to Another**
+
+一个常见的操作是从一个方向 **S** 经过最短的路径旋转到另一外方向 **t** 。四元数极大地简化了这一过程。首先，归一化(normalize) **s** 和*t*。然后计算单位旋转轴(unit rotation axis): $u=(s\times t)/\abs{\abs{s\times t}}$ 。接下来，$e=s\cdot t = \cos(2\phi)$并且  $\abs{\abs{s\times t}}$此处 $2\phi$是 s 和t之间的夹角。表示从s旋转到t的四元数为  $\hat{q} = (\sin\phi u,\cos\phi)$。实际上，可以使用三角恒等式、倍角公式、半角公式来简化$\hat{q} = (\frac{\sin\phi}{\sin2\phi}(s\times t),cos\phi)$  :
+
+![gongshi](./gongshi456.png)
+
+> [二倍角公式:](https://zhuanlan.zhihu.com/p/97186723/[https://baike.baidu.com/item/倍角公式](https://baike.baidu.com/item/倍角公式))
+> $\sin2\alpha = 2\sin\alpha\cos\alpha$
+>
+> $\cos2\alpha = \cos^2\alpha-\sin^2\alpha=2cos^2\alpha-1=1-2\sin^2\alpha$​
+> 所以，$\cos\phi = \sqrt{\frac{1+e}{2}}$  ，进一步可推导出公式4.56
+
+以这种方式(而不是先计算 $s\times t$ 的叉积，再归一化)产生四元数能够避免因为  s和  t指向的方向几乎相同而造成的数值不稳定性。而当s,t指向相反的方向时，两种方式都会有稳定性问题(Stability problems)，因为公式4.56中有除以0的情况出现(即，两个方向相反的向量夹角为  $2\phi = \pi$弧度，所以  ，$\cos2\phi=-1$​​出现分母 $1+e=1+(-1)=0$。当出现这种特殊情况时，任意垂直于s的旋转都可以用于旋转t。
+
+有时，我们需要从$s$旋转到另一外方向的$t$矩阵表示。由方程4.56可以推导出对应的旋转矩阵:
+
+![gongshi](./gongshi457.png)
+
+其中，
+
+![gongshi](./gongshi458.png)
+
+注意，必须小心**s**和**t**平行或几乎平行的情况，因为此时 $\abs{\abs{s\times t}}\approx 0$​ ，可以看到无法计算4.58中的h。如果 $\phi \approx 0$​，则我们可以返回单位矩阵(identity matrix)。然而，如果  $\phi\approx \pi$​则绕任意轴(*any* axis)旋转  弧度$\pi$​。这个轴可以通过求**s**和任意​不平行于**s**的向量的叉积得到。
 
 ### 4.4顶点混合
 
