@@ -560,3 +560,81 @@ vkDestroySwapchainKHR(device, swapChain, nullptr);//销毁
 std::vector<VkImageView> swapChainImageViews;
 ```
 
+关于图像视图的创建属性如下
+
+``` c++
+VkImageViewCreateInfo createInfo{};
+createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+createInfo.image = swapChainImages[i];
+createInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;//将图像视为1D纹理2D纹理3D纹理和立方体贴图
+createInfo.format = swapChainImageFormat;
+createInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;//components字段允许混合颜色通道。例如，将所有通道映射到单色纹理的红色通道,这里是默认
+createInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+createInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+createInfo.subresourceRange.baseMipLevel = 0;//mipmap设置
+createInfo.subresourceRange.levelCount = 1;
+createInfo.subresourceRange.baseArrayLayer = 0;
+createInfo.subresourceRange.layerCount = 1;//
+```
+
+接下来使用`vkCreateImage`来创建图像视图
+
+```c++
+vkCreateImageView(device, &createInfo, nullptr, &swapChainImageViews[i])
+vkDestroyImageView(device, imageView, nullptr);
+```
+
+当然我们这里需要使用循环来创建多个图像视图
+
+```c++
+swapChainImageViews.resize(swapChainImages.size());
+for (size_t i = 0; i < swapChainImages.size(); i++) {
+    .../
+}
+```
+
+### 着色器模块
+
+Vulkan 中的着色器代码必须以字节码格式指定,这种字节码被称为`spir-v`,使用字节码格式的优势在于，GPU 供应商编写的将着色器代码转换为本地代码的编译器明显不那么复杂。Khronos 发布了他们自己的独立于供应商的编译器，可以将 GLSL 编译为 SPIR-V。该编译器旨在验证您的着色器代码是否完全符合标准，并生成一个可以随程序一起提供的 SPIR-V 二进制文件。您还可以将此编译器作为库包含在运行时生成 SPIR-V，在vulkan的教程中，我们将使用`glslc.exe`来完成这个工作
+
+一个简单的vertexshader和fragmentshader的对比
+
+```glsl
+#version 450
+//vertex
+layout(location = 0) out vec3 fragColor;
+
+vec2 positions[3] = vec2[](
+    vec2(0.0, -0.5),
+    vec2(0.5, 0.5),
+    vec2(-0.5, 0.5)
+);
+
+vec3 colors[3] = vec3[](
+    vec3(1.0, 0.0, 0.0),
+    vec3(0.0, 1.0, 0.0),
+    vec3(0.0, 0.0, 1.0)
+);
+
+void main() {
+    gl_Position = vec4(positions[gl_VertexIndex], 0.0, 1.0);
+    fragColor = colors[gl_VertexIndex];
+}
+//fragment
+
+#version 450
+layout(location = 0) in vec3 fragColor;//和上面的location0部分绑定 
+
+layout(location = 0) out vec4 outColor;
+
+void main() {
+    outColor = vec4(fragColor, 1.0);
+}
+```
+
+输入变量不一定必须使用相同的名称，它们将使用`location`指令指定的索引链接在一起。
+
+
+
