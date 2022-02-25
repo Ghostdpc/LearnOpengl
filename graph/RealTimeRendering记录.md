@@ -327,7 +327,7 @@ GPU不仅可以用于实现传统的图形流水线，还可以用于计算股�
 
 ### 4.1基础变换
 
-![4zhangzongjie](D:\t\learning\4zhangzongjie.jpg)
+![4zhangzongjie](D:\t\learning\graph\4zhangzongjie.jpg)
 
 ### 4.1.1 平移
 
