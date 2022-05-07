@@ -653,4 +653,69 @@ auto t = std::async(baz,std::ref(t));//调用baz(x)
 auto f5 = std::async(move_only());//调用temp()，temp通过std::move(move_only)得到
 ```
 
-具体的传参操作如上。大多数情况下，期望值是否等待取决于async是否启动一个线程，或者是否有任务正在进行同步。我们可以通过一个额外参数来表明函数调用被延时到何时进行
+具体的传参操作如上。大多数情况下，期望值是否等待取决于async是否启动一个线程，或者是否有任务正在进行同步。我们可以通过一个额外参数来表明函数调用被延时到何时进行。如下所示。
+
+```c++
+auto f6=std::async(std::launch::async,Y(),1.2); //在新线程上执行
+std::future<test> f7 = std::async(std::launch::deferred,baz,std::ref(t)); //在wait()或者get()函数上执行
+auto f8 = std::async(std::launch::deferred|std::launch::async,baz,std::ref(t)); //根据实现选择执行方式
+auto f9 = std::async(baz,std::ref(t));
+f7.wait();
+```
+
+上述的代码中，`std::launch::async`的作用是表示函数必须在独立的线程上执行，而`std::launch::deferred`的作用是表明函数调用延迟到wait或者get函数调用时才执行，**另外，析构函数也会导致立刻执行**。`std::launch::deferred|std::launch::async`这个则表示可以选择任意的方式执行。
+
+`std::async`可以更容易的让算法分割到各个不同的任务中。当然，除了用`async`，我们还可以将任务包装进`std::packaged_task<>`实例中，或通过编写代码的方式，使用`std::promise<>`类型模板显式设置值。相对于promise，使用package_task 有更高层的抽象，我们就从它开始说起
+
+##### 任务与期望值关联
+
+这里我们需要聊得是`std::package_task`函数，这是一个仿函数，它本身和线程没啥关联，我们将其和期望值关联，就能和多线程扯上关系了
+
+这个函数的模板是传入一个函数签名，类似于函数指针，我们调用这个package_task对象就相当于是调用了这个函数。同时我们可以通过这个函数获取期望值，这样就可以做到阻塞线程进行等待，如下
+
+```c++
+auto task = [](int i){return 1;};
+std::packaged_task<int(int)> package{task};
+std::future<int> f = package.get_future();
+```
+
+上面的函数中，调用package就相当于执行了task，我们用package创建线程，并通过期望值来获取运行的结果，大概就是长这样。
+
+```c++
+auto task = [](int i){return 1;};
+std::packaged_task<int(int)> package{task};
+std::future<int> f = package.get_future();
+
+std::thread t{std::move(package),5};
+f.get();//阻塞到t结束
+t.join();
+```
+
+不过需要注意的是，调用get函数之前，一定要执行package_task，不然就会一直被阻塞
+
+##### std::promise
+
+看到这个内容的时候，不由得感慨程序设计上的东西还是很多相同的。
+
+```c++
+
+auto task = [](int i){return 1;};
+std::promise<int> p;
+std::thread tt{task,p.get_future()};
+std::this_thread::sleep_for(std::chrono::seconds(5));
+p.set_value(5);
+tt.join();
+```
+
+查看上面的用法，通过future值和promise的结合使用，我们可以将线程阻塞，知道我们调用了set_value函数的时候，期望值的状态变成了就绪，于是我们就变成了随时随地的给新线程传值。
+
+是不是很熟悉，这就是机制上和js中的相似，但是这里是多线程。
+
+思考 std::async、std::packaged_task 和 std::promise 之间的关系。总体来说，std::async 接口最简单，做的事情最多，抽象程度最高；std::packaged_task，抽象程度次之，需要额外的操作但却比较灵活；std::promise 功能最为单一，是三者中抽象程度最低的。
+
+##### 将异常存储在期望值中
+
+
+
+
+
