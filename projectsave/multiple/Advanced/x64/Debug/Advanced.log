@@ -1,2 +1,6 @@
 ﻿  main.cpp
-  Advanced.vcxproj -> G:\vspro\multiple\x64\Debug\Advanced.exe
+G:\FRONT\1\articlesave\projectsave\multiple\Advanced\Thread.h(46,1): warning C4267: “return”: 从“size_t”转换到“int”，可能丢失数据
+G:\FRONT\1\articlesave\projectsave\multiple\Advanced\Thread.h(44): message : 在编译 类 模板 成员函数“int threadsafe_queue<int>::size(void) const”时
+G:\FRONT\1\articlesave\projectsave\multiple\Advanced\main.cpp(86): message : 查看对正在编译的函数 模板 实例化“int threadsafe_queue<int>::size(void) const”的引用
+G:\FRONT\1\articlesave\projectsave\multiple\Advanced\main.cpp(4): message : 查看对正在编译的 类 模板 实例化“threadsafe_queue<int>”的引用
+  Advanced.vcxproj -> G:\FRONT\1\articlesave\projectsave\multiple\x64\Debug\Advanced.exe

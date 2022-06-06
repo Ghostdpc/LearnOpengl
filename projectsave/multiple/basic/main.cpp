@@ -2,7 +2,7 @@
 #include<Windows.h>
 #include <sstream>
 threadsafe_queue<int> queue;
-// std::condition_variable condition;
+std::condition_variable condition;
 std::atomic<bool> job_shared(false);
 
 
@@ -20,7 +20,7 @@ void runA()
 			std::cout << ostr.str();
 			Sleep(1);
 		}
-		job_shared.store(true);
+		condition.notify_one();
 	}
 	std::cout << "A End" << std::endl;
 }
@@ -28,23 +28,21 @@ void runA()
 void runB()
 {
 	int runNum = 0;
-	std::mutex m;
-	std::unique_lock<std::mutex> lk(m);
 	while (runNum<10)
 	{
-		 if (job_shared.load())
-		 {
-			job_shared.store(false);
-		 	for (int idx = 0; idx < 20; ++idx)
-		 	{
+		std::mutex m;
+		std::unique_lock<std::mutex> lk(m);//3
+		condition.wait(lk, [] {return queue.size() >= 20; });
+		for (int idx = 0; idx < 20; ++idx)
+		{
 				std::ostringstream ostr;
 		 		auto data = queue.pop();
 				ostr << "ThreadB Group " << runNum+1 << " num "<<idx+1<<" is " << *data<<"\n";
 				std::cout << ostr.str();
 		 		Sleep(1);
-		 	}
-			runNum++;
 		 }
+		runNum++;
+		lk.unlock();
 	}
 	std::cout << "B End" << std::endl;
 
