@@ -1,0 +1,75 @@
+整个niagara的代码结构大概如下图
+
+![frame](G:\FRONT\1\articlesave\niagara\frame.png)
+
+1. Niagara,这个是基本所有的运行逻辑都在这里面
+2. NiagaraAnimNotifies：看起来是用于播动画时通知niagara系统的，其中有一个文件AnimNotify_PlayNiagaraEffect.h基本可以看出是这个作用
+3. NiagaraCore：⼀些通⽤的类，包括datainterface,以及version控制等
+4. NiagaraEditor&NiagaraEditorWidgets：编辑器内使用的类 
+5. NiagaraShader：Niagara 的shader，或者说是处理shader的地方。里面会有包括shaderdebug，mipmap生成，shadermap管理等内容 。
+6. NiagaraVertexFactories：处理顶点相关数据的地方。区分了不同类型的粒子，如飘带类型，mesh类型的顶点。还会处理粒子排序，buffer绑定等。
+
+总体来说，虽说整个系统分了这么多个筛选器，但是实际上，除了Niagara这里面的内容，其他的里面的内容都比较少。
+
+### 1.System 和Emitter
+
+在编辑器里面使用的时候，我们会创建一个NiagaraSystem，而在System中，会选择一个emitter。
+
+我们通常在编辑器中使用的是Niagara资源主要有两种，一种是我们的Niagara发射器Emitter，一种是我们的Niagara系统System。并且我们发射器是由我们的Module共同组成，从而完整的形成我们的整个Niagara系统。其设计理念相比与Cascade，拆分的更加的细致，从而能偶比较细致的组合和复用。 
+
+所有使用Niagara 的地方都需要我们的UNiagaraComponent来进行，其主要是进行控制和Niagara系统的交互。
+
+我们在编辑器中资源对应的是UNiagaraSystem和UniagaraEmitter。一个UNiagaraComponent会拥有指定的一个UNiagaraSystem对应。但是UNiagaraSystem并不是我们运行时直接使用的数据。我们会在UNiagaraComponent初始化时构建对应UNiagaraSystem的FNiagaraSystemInstance，同样System里面的UNiagaraEmitter会生成对应的FNiagaraEmitterInstance。这如同类和实例的关系一般。
+
+对于每个FSystemInstance，会有⼀个相对应这个System类型的的Simulation,它和Instance并不是⼀对⼀的 关系。如果场景中存在同⼀个UNiagaraSystem的多个实例，其只对应⼀个  FNiagaraSystemSimulation。也就是说，对于数据结构⼀致的实例，会使⽤同⼀个Simulation进⾏模拟。因为相同的System的Spawn和Update与数据存储的大小和类型是相同的。提高缓存一致性和数据的存储效率。
+
+所有的FNiagaraSystemSimulation都由FNiagaraWorldManager统一进行管理。
+
+最开始我们有一个全局的管理器`FNiagaraWorldManager`。每一个System类型对应的唯一FNiagaraSystemSimulation都将在这里进行注册并且收到它的支配和管理。
+
+### 2.init和Update
+
+  Niagara将有Initial和Update两个重要阶段。其中Initial只在一开始运行一次，Update则每帧运行。而根据发生的位置不同分为SystemUpdate,EmitterUpdate和ParticleUpdate，分别代表每个System，每个Emitter，和每个粒子的更新。例如我们spawn一个NiagaraActor，对应的NiagaraSystem中有两个Emitter，每个Emitter发射1000个粒子。
+
+我们排除一些粒子间事件这种情况。那么当我们在初始化时，会调用一次SystemSpawn，调用各自的Emitter的EmitterSpawn，调用各自粒子的共两千次的ParticleSpawn。之后除非有新的Particle生成会调用particleSpawn，否则不会再调用任何Spawn。之后，我们每帧都会调用我们的各种Update去更新数据。
+
+我们的FNiagaraSystemSimulation的数据更新分成两个部分。
+
+1. Tick_GameThread。这里主要是更新一下系统时间等参数，然后调用FNiagaraSystemInstance的Tick_GameThread。在FNiagaraSystemInstance主要是更新System的Parameters和DataInterface。
+2. Tick_Concurrent，这个阶段可以不在Game线程完成。
+3. 对于那些新生成的SystemInstance调用它的spawn script。
+4. 是调用system update script进行System的更新。
+5. 将system模拟的结果注入到emitter的绑定数据中。
+6. 调用FNiagaraSystemInstance的Tick_Concurrent。
+
+在FNiagaraEmitterInstance::PreTick中，最主要的是执行Emitter的Spawn和Update脚本。
+
+
+
+GPU粒子的更新，则是主要靠cs
+
+FNiagaraGPUSystemTick
+
+### 3.Data和Render
+
+渲染器的类型可以是
+
+1. FNiagaraRendererLights：
+2. FNiagaraRendererMeshes：
+3. FNiagaraRendererRibbons
+4. FNiagaraRendererSprites
+5. FNiagaraRendererComponents
+
+1. Sprite的NumPrimitives是2（两个三角形），NumInstances是发出粒子的数量。
+2. Ribbon 因为是在CPU填充的顶点和索引，其NumPrimitives是自己的NumIndices/3,NumInstances是1。
+3. MeshRenderer 的NumPrimitives是对应的Mesh的索引数量，NumInstances是自己粒子的数量。
+
+除了MeshBatch  的通用数据我们需要填充，我们还需要填充他们各自的顶点工厂。其主要的渲染策略选择与其渲染器中选择的材质类型相关，因此都是FMaterialRenderProxy并不算特殊。其最特殊的是Niagara根据不同的渲染器类型，存在不同的渲染VertexFactory。分别是 1. FNiagaraSpriteVertexFactory 2. FNiagaraRibbonVertexFactory 3.  FNiagaraMeshVertexFactory
+
+其本身分别对应不同的渲染器。我们以最为常见的Sprite为例。在Shader中，我们需要访问两个Buffer，一个是渲染器的整体数据；一个是提供Instance绘制的Buffer。
+
+NiagaraEmitterInstanceBatcher::ExecuteAll
+
+
+
+对于CPU粒子来说我们需要将模拟完的数据传递给渲染线程。在NiagaraComponent中的`SendRenderDynamicData_Concurrent`中触发更新。每个Emitter的渲染器创建自己的DynamicData。
