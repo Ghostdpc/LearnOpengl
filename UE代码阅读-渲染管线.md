@@ -552,7 +552,7 @@ void FParallelMeshDrawCommandPass::DispatchPassSetup(
 
 ```
 
-熟悉taskgraph的人对这当中的FMeshPassProcessor，FMeshDrawCommandPassSetupTaskContext`,`FMeshDrawCommandPassSetupTask`,`FMeshDrawCommandInitResourcesTask应该比较熟悉，这里不展开说明taskgrpah，但是这个FMeshDrawCommandPassSetupTask可以聊一聊
+熟悉taskgraph的人对这当中的FMeshPassProcessor，FMeshDrawCommandPassSetupTaskContext,FMeshDrawCommandPassSetupTask`,`FMeshDrawCommandInitResourcesTask应该比较熟悉，这里不展开说明taskgrpah，但是这个FMeshDrawCommandPassSetupTask可以聊一聊
 
 这个task的作用是并行设置网格绘制指令的任务. 包含动态网格绘制命令的生成, 排序, 合并等。它担当了在网格渲染管线中担当了相当重要的角色， 其中排序阶段的键值由FMeshDrawCommandSortKey决定。它的源码如下，核心函数就是这个AnyThreadTask
 
@@ -689,6 +689,10 @@ class FMeshDrawCommandPassSetupTask
 }
 ```
 
+上面提到的Context，则是FMeshDrawCommandPassSetupTaskContext，这是一个包含有各种数据的上下文对象
+
+主要包括的数据有view相关的数据.pass processor数据，需在渲染线程预分配的资源，透明物体排序所需数据，这里就不意义列举出来了
+
 FMeshDrawCommandSortKey虽然可存储BasePass、透明Pass、普通Pass3种键值，但同时只有一种数据生效。
 
 ```c++
@@ -804,29 +808,315 @@ void GenerateDynamicMeshDrawCommands(
 
 ```
 
-在上面的过程中，FMeshDrawCommandPassSetupTaskContext则顾名思义，用于提供并行网格绘制命令通道设置任务(FMeshDrawCommandPassSetupTask)所需的上下文数据
-
 
 
 前文中我们说过，FMeshPassProcessor充当了将FMeshBatch转换成FMeshDrawCommands的角色。直接调用则是通过一个重载的AddMeshBatch函数
 
-由子类实现，每个子类通常对应着MeshPass枚举的一个通道。它的常见子类有：
+由子类实现，每个子类通常对应着MeshPass枚举的一个通道，比如
 
-- FDepthPassMeshProcessor：深度通道网格处理器，对应`EMeshPass::DepthPass`。
+- FDepthPassMeshProcessor-深度pass
+- FBasePassMeshProcessor-basepass
+- FHitPRoxyMeshProcesssor-
 
-而meshprecessor定义的文件中还有更多处理器
+我们以BasePassProcessor为例，看看AddMeshBatch函数
+
+```c++
+void FBasePassMeshProcessor::AddMeshBatch(const FMeshBatch& RESTRICT MeshBatch, uint64 BatchElementMask, const FPrimitiveSceneProxy* RESTRICT PrimitiveSceneProxy, int32 StaticMeshId)
+{
+	if (MeshBatch.bUseForMaterial)
+	{
+		// 确认材质
+		const FMaterialRenderProxy* MaterialRenderProxy = MeshBatch.MaterialRenderProxy;
+		while (MaterialRenderProxy)
+		{
+			const FMaterial* Material = MaterialRenderProxy->GetMaterialNoFallback(FeatureLevel);
+			if (Material && Material->GetRenderingThreadShaderMap())
+			{
+				if (TryAddMeshBatch(MeshBatch, BatchElementMask, PrimitiveSceneProxy, StaticMeshId, *MaterialRenderProxy, *Material))
+				{
+					break;
+				}
+			}
+
+			MaterialRenderProxy = MaterialRenderProxy->GetFallback(FeatureLevel);
+		}
+	}
+}
+
+
+bool FBasePassMeshProcessor::TryAddMeshBatch(const FMeshBatch& RESTRICT MeshBatch, uint64 BatchElementMask, const FPrimitiveSceneProxy* RESTRICT PrimitiveSceneProxy, int32 StaticMeshId, const FMaterialRenderProxy& MaterialRenderProxy, const FMaterial& Material)
+{
+	// 确定混合模式和材质设置
+	const EBlendMode BlendMode = Material.GetBlendMode();
+	//跳过一些材质设置
+    
+	//是否需要绘制
+	bool bShouldDraw = false;
+	if (AutoBeforeDOFTranslucencyBoundary > 0.0f && PrimitiveSceneProxy && bIsTranslucent && !Material.IsDeferredDecal())
+	{
+		//跳过一些判断条件的设置
+		if (TranslucencyPassType == ETranslucencyPass::TPT_TranslucencyStandard)
+		{
+			if (bIsStandardTranslucency)
+			{
+				bShouldDraw = true;
+			}
+			else if (bIsInDOFBackground)
+			{
+				bShouldDraw = bIsAfterDOF || bIsAfterDOFModulate;
+			}
+		}
+		else if (TranslucencyPassType == ETranslucencyPass::TPT_TranslucencyAfterDOF)
+		{
+			bShouldDraw = bIsAfterDOF && !bIsInDOFBackground;
+		}
+		else if (TranslucencyPassType == ETranslucencyPass::TPT_TranslucencyAfterDOFModulate)
+		{
+			bShouldDraw = bIsAfterDOFModulate && !bIsInDOFBackground;
+		}
+		else
+		{
+			unimplemented();
+		}
+	}
+	else
+	{
+		bShouldDraw = ShouldDraw(Material);
+	}
+
+	// Only draw opaque materials.
+	bool bResult = true;
+	if (bShouldDraw
+		&& (!PrimitiveSceneProxy || PrimitiveSceneProxy->ShouldRenderInMainPass())
+		&& ShouldIncludeDomainInMeshPass(Material.GetMaterialDomain())
+		&& ShouldIncludeMaterialInDefaultOpaquePass(Material))
+	{
+		//跳过一些判断条件设置
+		// Render volumetric translucent self-shadowing only for >= SM4 and fallback to non-shadowed for lesser shader models
+		if (bIsLitMaterial
+			&& bIsTranslucent
+			&& PrimitiveSceneProxy
+			&& PrimitiveSceneProxy->CastsVolumetricTranslucentShadow())
+		{
+			//跳过一些判断条件设置
+
+			if (bIsLitMaterial
+				&& bAllowStaticLighting
+				&& bUseVolumetricLightmap
+				&& PrimitiveSceneProxy)
+			{
+                //处理meshbatch
+				bResult = Process< FSelfShadowedVolumetricLightmapPolicy >(
+					MeshBatch,
+					BatchElementMask,
+					StaticMeshId,
+					PrimitiveSceneProxy,
+					MaterialRenderProxy,
+					Material,
+					bIsMasked,
+					bIsTranslucent,
+					ShadingModels,
+					FSelfShadowedVolumetricLightmapPolicy(),
+					ElementData,
+					MeshFillMode,
+					MeshCullMode);
+			}
+			else if (IsIndirectLightingCacheAllowed(FeatureLevel)
+				&& bAllowIndirectLightingCache
+				&& PrimitiveSceneProxy)
+			{
+				//处理meshbatch
+				bResult = Process< FSelfShadowedCachedPointIndirectLightingPolicy >(
+					MeshBatch,
+					BatchElementMask,
+					StaticMeshId,
+					PrimitiveSceneProxy,
+					MaterialRenderProxy,
+					Material,
+					bIsMasked,
+					bIsTranslucent,
+					ShadingModels,
+					FSelfShadowedCachedPointIndirectLightingPolicy(),
+					ElementData,
+					MeshFillMode,
+					MeshCullMode);
+			}
+			else
+			{
+                //处理meshbatch
+				bResult = Process< FSelfShadowedTranslucencyPolicy >(
+					MeshBatch,
+					BatchElementMask,
+					StaticMeshId,
+					PrimitiveSceneProxy,
+					MaterialRenderProxy,
+					Material,
+					bIsMasked,
+					bIsTranslucent,
+					ShadingModels,
+					FSelfShadowedTranslucencyPolicy(),
+					ElementData.SelfShadowTranslucencyUniformBuffer,
+					MeshFillMode,
+					MeshCullMode);
+			}
+		}
+		else
+		{
+			ELightMapPolicyType UniformLightMapPolicyType = GetUniformLightMapPolicyType(FeatureLevel, Scene, MeshBatch, PrimitiveSceneProxy, Material);
+            //处理meshbatch
+			bResult = Process< FUniformLightMapPolicy >(
+				MeshBatch,
+				BatchElementMask,
+				StaticMeshId,
+				PrimitiveSceneProxy,
+				MaterialRenderProxy,
+				Material,
+				bIsMasked,
+				bIsTranslucent,
+				ShadingModels,
+				FUniformLightMapPolicy(UniformLightMapPolicyType),
+				MeshBatch.LCI,
+				MeshFillMode,
+				MeshCullMode);
+		}
+	}
+
+	return bResult;
+}
+```
+
+在上文的Process函数中，我们会做的事情主要包括获取并设置对应的shader，设置pass中各种属性，具体设置什么属性会根据具体的passprocessor实现。最终通过BuildMeshDrawCommands函数来创建命令。BuildMeshDrawCommands的代码如下
+
+```c++
+template<typename PassShadersType, typename ShaderElementDataType>
+void FMeshPassProcessor::BuildMeshDrawCommands(
+	const FMeshBatch& RESTRICT MeshBatch,
+	uint64 BatchElementMask,
+	const FPrimitiveSceneProxy* RESTRICT PrimitiveSceneProxy,
+	const FMaterialRenderProxy& RESTRICT MaterialRenderProxy,
+	const FMaterial& RESTRICT MaterialResource,
+	const FMeshPassProcessorRenderState& RESTRICT DrawRenderState,
+	PassShadersType PassShaders,
+	ERasterizerFillMode MeshFillMode,
+	ERasterizerCullMode MeshCullMode,
+	FMeshDrawCommandSortKey SortKey,
+	EMeshPassFeatures MeshPassFeatures,
+	const ShaderElementDataType& ShaderElementData)
+{
+	const FVertexFactory* RESTRICT VertexFactory = MeshBatch.VertexFactory;
+	const FPrimitiveSceneInfo* RESTRICT PrimitiveSceneInfo = PrimitiveSceneProxy ? PrimitiveSceneProxy->GetPrimitiveSceneInfo() : nullptr;
+	//最终转化出来的DrawCommand，看上去是共享的
+	FMeshDrawCommand SharedMeshDrawCommand;
+    
+    //....
+    
+	//pipelinestate object
+
+	FGraphicsMinimalPipelineStateInitializer PipelineState;
+	PipelineState.PrimitiveType = (EPrimitiveType)MeshBatch.Type;
+	PipelineState.ImmutableSamplerState = MaterialRenderProxy.ImmutableSamplerState;
+
+	//.....
+    //pipelinestate object设置，MeshDrawCommand设置
+	//.....
+	
+    //shader设置
+	int32 DataOffset = 0;
+	if (PassShaders.VertexShader.IsValid())
+	{
+		FMeshDrawSingleShaderBindings ShaderBindings = SharedMeshDrawCommand.ShaderBindings.GetSingleShaderBindings(SF_Vertex, DataOffset);
+		PassShaders.VertexShader->GetShaderBindings(Scene, FeatureLevel, PrimitiveSceneProxy, MaterialRenderProxy, MaterialResource, DrawRenderState, ShaderElementData, ShaderBindings);
+	}
+
+	//......
+    
+	//处理Meshbatch里面的数据，主要是遍历element并将其添加到DrawListContext中，以及shader配置
+	for (int32 BatchElementIndex = 0; BatchElementIndex < NumElements; BatchElementIndex++)
+	{
+		if ((1ull << BatchElementIndex) & BatchElementMask)
+		{	
+            //element独享的drawcmooand
+			const FMeshBatchElement& BatchElement = MeshBatch.Elements[BatchElementIndex];
+			FMeshDrawCommand& MeshDrawCommand = DrawListContext->AddCommand(SharedMeshDrawCommand, NumElements);
+			
+			//..... 
+    
+			DataOffset = 0;
+			if (PassShaders.VertexShader.IsValid())
+			{
+				FMeshDrawSingleShaderBindings VertexShaderBindings = MeshDrawCommand.ShaderBindings.GetSingleShaderBindings(SF_Vertex, DataOffset);
+				FMeshMaterialShader::GetElementShaderBindings(PassShaders.VertexShader, Scene, ViewIfDynamicMeshCommand, VertexFactory, InputStreamType, FeatureLevel, PrimitiveSceneProxy, MeshBatch, BatchElement, ShaderElementData, VertexShaderBindings, MeshDrawCommand.VertexStreams);
+			}
+
+			//....... 
+            
+			FMeshDrawCommandPrimitiveIdInfo IdInfo = GetDrawCommandPrimitiveId(PrimitiveSceneInfo, BatchElement);
+
+			FMeshProcessorShaders ShadersForDebugging = PassShaders.GetUntypedShaders();
+            
+     		//将数据添加到上下文，后续绘制会用到
+			DrawListContext->FinalizeCommand(MeshBatch, BatchElementIndex, IdInfo, MeshFillMode, MeshCullMode, SortKey, Flags, PipelineState, &ShadersForDebugging, MeshDrawCommand);
+		}
+	}
+}
+```
+
+BuildMeshDrawCommands在最后阶段会调用FMeshPassDrawListContext::FinalizeCommand。FMeshPassDrawListContext需要由具体的子类实现，包括缓存网格的绘制指令上下文，动态绘制指令上下文，naite绘制指令上下文。分别代表了动态网格绘制指令和缓存网格绘制指令的上下文。我们以动态的为例
+
+```c++
+class FDynamicPassMeshDrawListContext : public FMeshPassDrawListContext
+{
+public:
+	//......
+
+	virtual FMeshDrawCommand& AddCommand(FMeshDrawCommand& Initializer, uint32 NumElements) override final
+	{
+		const int32 Index = DrawListStorage.MeshDrawCommands.AddElement(Initializer);
+		FMeshDrawCommand& NewCommand = DrawListStorage.MeshDrawCommands[Index];
+		return NewCommand;
+	}
+    
+    virtual void FinalizeCommand(
+		const FMeshBatch& MeshBatch, 
+		int32 BatchElementIndex,
+		const FMeshDrawCommandPrimitiveIdInfo &IdInfo,
+		ERasterizerFillMode MeshFillMode,
+		ERasterizerCullMode MeshCullMode,
+		FMeshDrawCommandSortKey SortKey,
+		EFVisibleMeshDrawCommandFlags Flags,
+		const FGraphicsMinimalPipelineStateInitializer& PipelineState,
+		const FMeshProcessorShaders* ShadersForDebugging,
+		FMeshDrawCommand& MeshDrawCommand) override final
+	{
+		FGraphicsMinimalPipelineStateId PipelineId = FGraphicsMinimalPipelineStateId::GetPipelineStateId(PipelineState, GraphicsMinimalPipelineStateSet, NeedsShaderInitialisation);
+
+		MeshDrawCommand.SetDrawParametersAndFinalize(MeshBatch, BatchElementIndex, PipelineId, ShadersForDebugging);
+
+		FVisibleMeshDrawCommand NewVisibleMeshDrawCommand;
+		//@todo MeshCommandPipeline - assign usable state ID for dynamic path draws
+		// Currently dynamic path draws will not get dynamic instancing, but they will be roughly sorted by state
+		const FMeshBatchElement& MeshBatchElement = MeshBatch.Elements[BatchElementIndex];
+        //这里将meshdrawcommand转换为了visiblemeshdrawcommand，估计是做了可见性剔除
+		NewVisibleMeshDrawCommand.Setup(&MeshDrawCommand, IdInfo, -1, MeshFillMode, MeshCullMode, Flags, SortKey,
+			MeshBatchElement.bIsInstanceRuns ? MeshBatchElement.InstanceRuns : nullptr,
+			MeshBatchElement.bIsInstanceRuns ? MeshBatchElement.NumInstances : 0
+			);
+		DrawList.Add(NewVisibleMeshDrawCommand);
+	}
+    //其他函数
+    //......
+}
+```
+
+从FMeshBatch到FMeshDrawCommand阶段，渲染器做了大量的处理，为的是将FMeshBatch转换到FMeshDrawCommand，并保存到FMeshPassProcessor的FMeshPassDrawListContext成员变量中。为后续绘制做准备
+
+FMeshDrawCommand保存了所有RHI所需的绘制网格的信息，是基于数据驱动的设计，因此可以共享它的设备上下文。
 
 
 
-FGraphicsMinimalPipelineStateInitializer
+#### 总结
 
-
-
-`FMeshDrawCommand`保存了所有RHI所需的绘制网格的信息，这些信息时平台无关和图形API无关的（stateless），并且是基于数据驱动的设计，因此可以共享它的设备上下文。
-
-
-
-由此可见，`FMeshPassProcessor`的主要作用是：
+由此可见，FMeshPassProcessor的主要作用是：
 
 - Pass过滤。将该Pass无关的MeshBatch给过滤掉，比如深度Pass过滤掉透明物体。
 - 选择绘制命令所需的Shader及渲染状态（深度、模板、混合状态、光栅化状态等）。
@@ -836,17 +1126,8 @@ FGraphicsMinimalPipelineStateInitializer
   - 材质绑定。
   - Pass的与绘制指令相关的绑定。
 
-BuildMeshDrawCommands将FMeshBatch转换成FMeshDrawCommands。
-
-
-
-`FMeshPassProcessor::BuildMeshDrawCommands`在最后阶段会调用`FMeshPassDrawListContext::FinalizeCommand`。
-
-`FMeshPassDrawListContext`提供了两个基本接口，是个抽象类，派生类有`FDynamicPassMeshDrawListContext`和`FCachedPassMeshDrawListContext`，分别代表了动态网格绘制指令和缓存网格绘制指令的上下文。它们的接口和解析如下：
-
-
-
-由此可见，从`FMeshBatch`到`FMeshDrawCommand`阶段，渲染器做了大量的处理，为的是将`FMeshBatch`转换到`FMeshDrawCommand`，并保存到FMeshPassProcessor的FMeshPassDrawListContext成员变量中。期间还从各个对象中收集或处理网格绘制指令所需的一切数据，以便进入后续的渲染流程
+- 通过BuildMeshDrawCommands将FMeshBatch转换成FMeshDrawCommands。
+- 最终生成FMeshPassDrawListContext给绘制使用
 
 
 
@@ -858,7 +1139,7 @@ BuildMeshDrawCommands将FMeshBatch转换成FMeshDrawCommands。
 
 ### 从FMeshDrawCommand到RHICommandList
 
-FMeshBatch转换成FMeshDrawCommand后，每个Pass都对应了一个FMeshPassProcessor，每个FMeshPassProcessor保存了该Pass需要绘制的所有FMeshDrawCommand，以便渲染器在合适的时间触发并渲染。
+FMeshBatch转换成FMeshDrawCommand后，每个Pass都对应了一个FMeshPassProcessor，每个FMeshPassProcessor保存了该Pass需要绘制的所有FMeshDrawCommand，以便渲染器在合适的时间触发并渲染。我们以一个render为例，来描述一下这个绘制过程
 
 代码如下
 
