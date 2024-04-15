@@ -1141,32 +1141,323 @@ FMeshDrawCommand保存了所有RHI所需的绘制网格的信息，是基于数�
 
 FMeshBatch转换成FMeshDrawCommand后，每个Pass都对应了一个FMeshPassProcessor，每个FMeshPassProcessor保存了该Pass需要绘制的所有FMeshDrawCommand，以便渲染器在合适的时间触发并渲染。我们以一个render为例，来描述一下这个绘制过程
 
-代码如下
+在一个pass的绘制过程中，我们始终需要将绘制命令通过taskgraph提交出去绘制。因此我们总能找到这么一个函数
 
 ```c++
+	GraphBuilder.AddPass(
+						RDG_EVENT_NAME("SkyPassParallel"),
+						SkyPassPassParameters,
+						ERDGPassFlags::Raster | ERDGPassFlags::SkipRenderPass,
+						[this, &View, SkyPassPassParameters](const FRDGPass* InPass, FRHICommandListImmediate& RHICmdList)
+					{
+						FRDGParallelCommandListSet ParallelCommandListSet(InPass, RHICmdList, GET_STATID(STAT_CLP_BasePass), View, FParallelCommandListBindings(SkyPassPassParameters));
+                        //这个枚举代表着这是什么pass
+						View.ParallelMeshDrawCommandPasses[EMeshPass::SkyPass].DispatchDraw(&ParallelCommandListSet, RHICmdList, &SkyPassPassParameters->InstanceCullingDrawParams);
+					});
 ```
 
-例如，可以通过
+这个函数(DispatchDraw)具体是创建绘制task，并将其添加到绘制列表中
 
-```MeshDrawCommands.cpp```
+```C++
+//......	
+if (ParallelCommandListSet)
+	{
+		//.....
+		// 构造与工作线程数量相同的并行绘制任务数。
+		const int32 NumThreads = FMath::Min<int32>(FTaskGraphInterface::Get().GetNumWorkerThreads(), ParallelCommandListSet->Width);
+		const int32 NumTasks = FMath::Min<int32>(NumThreads, FMath::DivideAndRoundUp(MaxNumDraws, ParallelCommandListSet->MinDrawsPerCommandList));
+		const int32 NumDrawsPerTask = FMath::DivideAndRoundUp(MaxNumDraws, NumTasks);
+    
+    	 // 遍历NumTasks次，构造NumTasks个绘制任务（FDrawVisibleMeshCommandsAnyThreadTask）实例。
+		for (int32 TaskIndex = 0; TaskIndex < NumTasks; TaskIndex++)
+		{
+			const int32 StartIndex = TaskIndex * NumDrawsPerTask;
+			const int32 NumDraws = FMath::Min(NumDrawsPerTask, MaxNumDraws - StartIndex);
+			checkSlow(NumDraws > 0);
 
-- 每个Pass都会执行类似上面的过程，同一帧会执行多次，但并不是所有的Pass都会开启，可通过view的PassMask动态开启和关闭。
-- DispatchDraw和SubmitMeshDrawCommandsRange特意采用了扁平化的数组，并且考虑了以下因素：
-  - 只通过可见性集合就可以方便快捷地划分FVisibleMeshDrawCommand的数组，以便扁平化地将向多线程系统TaskGraph提交FMeshDrawCommand绘制指令。
-  - 通过对FMeshDrawCommand列表的排序和增加StateCache减少向RHICommandList提交的指令数量，减少RHICommandList转换和执行的负载。增加这个步骤后，Fortnite可以减少20%的RHI执行时间。
-  - 缓存一致性的遍历。紧密地打包FMeshDrawCommand，轻量化、扁平化且连续地在内存中存储SubmitDraw所需的数据，可以提升缓存和预存取命中率。
-    - `TChunkedArray<FMeshDrawCommand> MeshDrawCommands;`
-    - `typedef TArray<FVisibleMeshDrawCommand, SceneRenderingAllocator> FMeshCommandOneFrameArray;`
-    - `TArray<FMeshDrawShaderBindingsLayout, TInlineAllocator<2>>ShaderLayouts;`
-    - `typedef TArray<FVertexInputStream, TInlineAllocator<4>>FVertexInputStreamArray;`
-    - `const int32 NumInlineShaderBindings = 10;`
-- 将MeshDrawCommandPasses转成RHICommandList的命令时支持并行模式，并行的分配策略只是简单地将地将数组平均分成等同于工作线程的数量，然后每个工作线程执行指定范围的绘制指令。这样做的好处是实现简单快捷易于理解，提升CPU的cache命中率，缺点是每个组内的任务执行时间可能存在较大的差异，这样整体的执行时间由最长的一组决定，势必拉长了时间，降低并行效率。针对这个问题，笔者想出了一些策略：
-  - 启发性策略。记录上一帧每个MeshDrawCommand的执行时间，下一帧根据它们的执行时间将相邻的MeshDrawCommand相加，当它们的总和趋近每组的平均值时，作为一组执行体。
-  - 考察MeshDrawCommand的某个或某几个属性。比如以网格的面数或材质数为分组的依据，将每组MeshDrawCommand的考察属性之和大致相同。
+			FRHICommandList* CmdList = ParallelCommandListSet->NewParallelCommandList();
+			//创建绘制task，并加入到并发列表中并发绘制
+			FGraphEventRef AnyThreadCompletionEvent = TGraphTask<FDrawVisibleMeshCommandsAnyThreadTask>::CreateTask(&Prereqs, RenderThread)
+				.ConstructAndDispatchWhenReady(*CmdList, TaskContext.InstanceCullingContext, TaskContext.MeshDrawCommands, TaskContext.MinimalPipelineStatePassSet,
+					OverrideArgs,
+					TaskContext.InstanceFactor,
+					TaskIndex, NumTasks);
+			
+			ParallelCommandListSet->AddParallelCommandList(CmdList, AnyThreadCompletionEvent, NumDraws);
+		}
+	}
+//....
+
+
+```
+
+需要注意的是，TaskContext中的MeshDrawCommands，实际上是visibable mesh draw commands。FDrawVisibleMeshCommandsAnyThreadTask的具体执行如下
+
+```c++
+class FDrawVisibleMeshCommandsAnyThreadTask : public FRenderTask
+{
+    //...
+    void DoTask(ENamedThreads::Type CurrentThread, const FGraphEventRef& MyCompletionGraphEvent)
+	{
+		FOptionalTaskTagScope Scope(ETaskTag::EParallelRenderingThread);
+		SCOPED_NAMED_EVENT_TEXT("DrawVisibleMeshCommandsAnyThreadTask", FColor::Magenta);
+		checkSlow(RHICmdList.IsInsideRenderPass());
+
+		// check for the multithreaded shader creation has been moved to FShaderCodeArchive::CreateShader() 
+
+		// 计算绘制范围
+		const int32 DrawNum = VisibleMeshDrawCommands.Num();
+		const int32 NumDrawsPerTask = TaskIndex < DrawNum ? FMath::DivideAndRoundUp(DrawNum, TaskNum) : 0;
+		const int32 StartIndex = TaskIndex * NumDrawsPerTask;
+		const int32 NumDraws = FMath::Min(NumDrawsPerTask, DrawNum - StartIndex);
+		//具体处理drawcall到cmdlist的录入
+		InstanceCullingContext.SubmitDrawCommands(
+			VisibleMeshDrawCommands,
+			GraphicsMinimalPipelineStateSet,
+			OverrideArgs,
+			StartIndex,
+			NumDraws,
+			InstanceFactor,
+			RHICmdList);
+		RHICmdList.EndRenderPass();
+		RHICmdList.FinishRecording();
+	}
+    //......
+}
+```
+
+SubmitDrawCommands的作用就是具体将meshcommand的数据填充到rhicmdlist中，完成录入绘制指令的操作
+
+```c++
+void FInstanceCullingContext::SubmitDrawCommands(
+	const FMeshCommandOneFrameArray& VisibleMeshDrawCommands,
+	const FGraphicsMinimalPipelineStateSet& GraphicsMinimalPipelineStateSet,
+	const FMeshDrawCommandOverrideArgs& OverrideArgs,
+	int32 StartIndex,
+	int32 NumMeshDrawCommands,
+	uint32 InInstanceFactor,
+	FRHICommandList& RHICmdList) const
+{
+	if (VisibleMeshDrawCommands.Num() == 0)
+	{
+		// FIXME: looks like parallel rendering can spawn empty FDrawVisibleMeshCommandsAnyThreadTask
+		return;
+	}
+	
+	if (IsEnabled())
+	{
+		check(MeshDrawCommandInfos.Num() >= (StartIndex + NumMeshDrawCommands));
+	
+		FMeshDrawCommandStateCache StateCache;
+		INC_DWORD_STAT_BY(STAT_MeshDrawCalls, NumMeshDrawCommands);
+		//提交一定范围内的command
+		for (int32 DrawCommandIndex = StartIndex; DrawCommandIndex < StartIndex + NumMeshDrawCommands; DrawCommandIndex++)
+		{
+			//SCOPED_CONDITIONAL_DRAW_EVENTF(RHICmdList, MeshEvent, GEmitMeshDrawEvent != 0, TEXT("Mesh Draw"));
+			const FVisibleMeshDrawCommand& VisibleMeshDrawCommand = VisibleMeshDrawCommands[DrawCommandIndex];
+			const FMeshDrawCommandInfo& DrawCommandInfo = MeshDrawCommandInfos[DrawCommandIndex];
+			
+			uint32 InstanceFactor = InInstanceFactor;
+			uint32 IndirectArgsByteOffset = 0;
+			FRHIBuffer* IndirectArgsBuffer = nullptr;
+			if (DrawCommandInfo.bUseIndirect)
+			{
+				IndirectArgsByteOffset = OverrideArgs.IndirectArgsByteOffset + DrawCommandInfo.IndirectArgsOffsetOrNumInstances;
+				IndirectArgsBuffer = OverrideArgs.IndirectArgsBuffer;
+			}
+			else
+			{
+				// TODO: need a better way to override number of instances
+				InstanceFactor = InInstanceFactor * DrawCommandInfo.IndirectArgsOffsetOrNumInstances;
+			}
+			
+			const int32 InstanceDataByteOffset = OverrideArgs.InstanceDataByteOffset + DrawCommandInfo.InstanceDataByteOffset;
+
+			FMeshDrawCommand::SubmitDraw(*VisibleMeshDrawCommand.MeshDrawCommand, GraphicsMinimalPipelineStateSet, OverrideArgs.InstanceBuffer, InstanceDataByteOffset, InstanceFactor, RHICmdList, StateCache, IndirectArgsBuffer, IndirectArgsByteOffset);
+		}
+	}
+	else
+	{
+        //看着是关闭culling后的提交
+		SubmitMeshDrawCommandsRange(VisibleMeshDrawCommands, GraphicsMinimalPipelineStateSet, nullptr, 0, 0, false, StartIndex, NumMeshDrawCommands, InInstanceFactor, RHICmdList);
+	}
+}
 
 
 
-`FMeshDrawCommand::SubmitDraw`支持四种绘制模型，一个维度为是否有顶点索引，另一个维度为是否Indirect绘制。
+void FMeshDrawCommand::SubmitDraw(
+	const FMeshDrawCommand& RESTRICT MeshDrawCommand,
+	const FGraphicsMinimalPipelineStateSet& GraphicsMinimalPipelineStateSet,
+	FRHIBuffer* ScenePrimitiveIdsBuffer,
+	int32 PrimitiveIdOffset,
+	uint32 InstanceFactor,
+	FRHICommandList& RHICmdList,
+	FMeshDrawCommandStateCache& RESTRICT StateCache,
+	FRHIBuffer* IndirectArgsOverrideBuffer,
+	uint32 IndirectArgsOverrideByteOffset)
+{
+	//debug信息
+	bool bAllowSkipDrawCommand = true;
+    //begin的作用是通过meshcommand设置各种命令
+	if (SubmitDrawBegin(MeshDrawCommand, GraphicsMinimalPipelineStateSet, ScenePrimitiveIdsBuffer, PrimitiveIdOffset, InstanceFactor, RHICmdList, StateCache, bAllowSkipDrawCommand))
+	{
+        //根据不同的数据调用不同类型的绘制指令到RHICommandList.
+		SubmitDrawEnd(MeshDrawCommand, InstanceFactor, RHICmdList, IndirectArgsOverrideBuffer, IndirectArgsOverrideByteOffset);
+	}
+}
+
+bool FMeshDrawCommand::SubmitDrawBegin(
+	const FMeshDrawCommand& RESTRICT MeshDrawCommand, 
+	const FGraphicsMinimalPipelineStateSet& GraphicsMinimalPipelineStateSet,
+	FRHIBuffer* ScenePrimitiveIdsBuffer,
+	int32 PrimitiveIdOffset,
+	uint32 InstanceFactor,
+	FRHICommandList& RHICmdList,
+	FMeshDrawCommandStateCache& RESTRICT StateCache,
+	bool bAllowSkipDrawCommand)
+{
+	checkSlow(MeshDrawCommand.CachedPipelineId.IsValid());
+
+	
+	const FGraphicsMinimalPipelineStateInitializer& MeshPipelineState = MeshDrawCommand.CachedPipelineId.GetPipelineState(GraphicsMinimalPipelineStateSet);
+	//设置和缓存pso
+	if (MeshDrawCommand.CachedPipelineId.GetId() != StateCache.PipelineId)
+	{
+		FGraphicsPipelineStateInitializer GraphicsPSOInit = MeshPipelineState.AsGraphicsPipelineStateInitializer();
+		RHICmdList.ApplyCachedRenderTargets(GraphicsPSOInit);
+
+		EPSOPrecacheResult PSOPrecacheResult = RetrieveAndCachePSOPrecacheResult(MeshPipelineState, GraphicsPSOInit, bAllowSkipDrawCommand);
+
+		//...debugdata
+
+		// Try and skip draw if the PSO is not precached yet.
+		if (bAllowSkipDrawCommand && GSkipDrawOnPSOPrecaching && PSOPrecacheResult == EPSOPrecacheResult::Active)
+		{
+			return false;
+		}
+
+		// We can set the new StencilRef here to avoid the set below
+        //这里提前设置模板，虽然我看不懂。但是大受震撼
+		bool bApplyAdditionalState = true;
+		SetGraphicsPipelineState(RHICmdList, GraphicsPSOInit, MeshDrawCommand.StencilRef, EApplyRendertargetOption::CheckApply, bApplyAdditionalState, PSOPrecacheResult);
+		StateCache.SetPipelineState(MeshDrawCommand.CachedPipelineId.GetId());
+		StateCache.StencilRef = MeshDrawCommand.StencilRef;
+	}
+	//设置模板缓冲
+	if (MeshDrawCommand.StencilRef != StateCache.StencilRef)
+	{
+		RHICmdList.SetStencilRef(MeshDrawCommand.StencilRef);
+		StateCache.StencilRef = MeshDrawCommand.StencilRef;
+	}
+	//设置顶点数据
+	for (int32 VertexBindingIndex = 0; VertexBindingIndex < MeshDrawCommand.VertexStreams.Num(); VertexBindingIndex++)
+	{
+		const FVertexInputStream& Stream = MeshDrawCommand.VertexStreams[VertexBindingIndex];
+
+		if (MeshDrawCommand.PrimitiveIdStreamIndex != -1 && Stream.StreamIndex == MeshDrawCommand.PrimitiveIdStreamIndex)
+		{
+			RHICmdList.SetStreamSource(Stream.StreamIndex, ScenePrimitiveIdsBuffer, PrimitiveIdOffset);
+			StateCache.VertexStreams[Stream.StreamIndex] = Stream;
+		}
+		else if (StateCache.VertexStreams[Stream.StreamIndex] != Stream)
+		{
+			RHICmdList.SetStreamSource(Stream.StreamIndex, Stream.VertexBuffer, Stream.Offset);
+			StateCache.VertexStreams[Stream.StreamIndex] = Stream;
+		}
+	}
+	//设置shader绑定的资源
+	MeshDrawCommand.ShaderBindings.SetOnCommandList(RHICmdList, MeshPipelineState.BoundShaderState.AsBoundShaderState(), StateCache.ShaderBindings);
+
+	return true;
+}
+//具体调用绘制
+void FMeshDrawCommand::SubmitDrawEnd(const FMeshDrawCommand& MeshDrawCommand, uint32 InstanceFactor, FRHICommandList& RHICmdList,
+	FRHIBuffer* IndirectArgsOverrideBuffer,
+	uint32 IndirectArgsOverrideByteOffset)
+{
+	const bool bDoOverrideArgs = IndirectArgsOverrideBuffer != nullptr && MeshDrawCommand.PrimitiveIdStreamIndex >= 0;
+	 // 根据不同的数据调用不同类型的绘制指令到RHICommandList.
+	if (MeshDrawCommand.IndexBuffer)
+	{
+		if (MeshDrawCommand.NumPrimitives > 0 && !bDoOverrideArgs)
+		{
+			RHICmdList.DrawIndexedPrimitive(
+				MeshDrawCommand.IndexBuffer,
+				MeshDrawCommand.VertexParams.BaseVertexIndex,
+				0,
+				MeshDrawCommand.VertexParams.NumVertices,
+				MeshDrawCommand.FirstIndex,
+				MeshDrawCommand.NumPrimitives,
+				MeshDrawCommand.NumInstances * InstanceFactor
+			);
+		}
+		else
+		{
+			RHICmdList.DrawIndexedPrimitiveIndirect(
+				MeshDrawCommand.IndexBuffer,
+				bDoOverrideArgs ? IndirectArgsOverrideBuffer : MeshDrawCommand.IndirectArgs.Buffer,
+				bDoOverrideArgs ? IndirectArgsOverrideByteOffset : MeshDrawCommand.IndirectArgs.Offset
+			);
+		}
+	}
+	else
+	{
+		if (MeshDrawCommand.NumPrimitives > 0 && !bDoOverrideArgs)
+		{
+			RHICmdList.DrawPrimitive(
+				MeshDrawCommand.VertexParams.BaseVertexIndex + MeshDrawCommand.FirstIndex,
+				MeshDrawCommand.NumPrimitives,
+				MeshDrawCommand.NumInstances * InstanceFactor);
+		}
+		else
+		{
+			RHICmdList.DrawPrimitiveIndirect(
+				bDoOverrideArgs ? IndirectArgsOverrideBuffer : MeshDrawCommand.IndirectArgs.Buffer,
+				bDoOverrideArgs ? IndirectArgsOverrideByteOffset : MeshDrawCommand.IndirectArgs.Offset
+			);
+		}
+	}
+}
+```
+
+
+
+每个绘制的pass都会走上面的流程，将meshdrawcommand到使用具体的绘制指令
+
+在上述的提交绘制过程中，有一些优化的点。
+
+- 绘制的很多数据都是TArray，扁平化且连续地在内存中存储SubmitDraw所需的数据，可以提升缓存和预存取命中
+  - `TChunkedArray<FMeshDrawCommand> MeshDrawCommands;`-出现于GenerateDynamicMeshDrawCommands,用于生成meshcommand
+  - `typedef TArray<FVisibleMeshDrawCommand, SceneRenderingAllocator> FMeshCommandOneFrameArray;` 绘制时使用的command
+- 通过对FMeshDrawCommand列表的排序和增加StateCache减少向RHICommandList提交的指令数量，减少RHICommandList转换和执行的负载。增加这个步骤后，Fortnite可以减少20%的RHI执行时间。
+- 通过可见性集合就可以方便快捷地划分FVisibleMeshDrawCommand的数组，以便扁平化地将向多线程系统TaskGraph提交FMeshDrawCommand绘制指令
+
+
+
+另外有一些比较有意思的DispatchDraw的点.
+
+```c++
+		const int32 NumThreads = FMath::Min<int32>(FTaskGraphInterface::Get().GetNumWorkerThreads(), ParallelCommandListSet->Width);
+		const int32 NumTasks = FMath::Min<int32>(NumThreads, FMath::DivideAndRoundUp(MaxNumDraws, ParallelCommandListSet->MinDrawsPerCommandList));
+		const int32 NumDrawsPerTask = FMath::DivideAndRoundUp(MaxNumDraws, NumTasks);
+```
+
+这里的并行的分配策略只是简单地将地将数组平均分成等同于工作线程的数量，然后每个工作线程执行指定范围的绘制指令。
+
+看到一个说法
+
+>这样做的好处是实现简单快捷易于理解，提升CPU的cache命中率，缺点是每个组内的任务执行时间可能存在较大的差异，这样整体的执行时间由最长的一组决定，势必拉长了时间，降低并行效率。针对这个问题，笔者想出了一些策略：
+>
+>- 启发性策略。记录上一帧每个MeshDrawCommand的执行时间，下一帧根据它们的执行时间将相邻的MeshDrawCommand相加，当它们的总和趋近每组的平均值时，作为一组执行体。
+>- 考察MeshDrawCommand的某个或某几个属性。比如以网格的面数或材质数为分组的依据，将每组MeshDrawCommand的考察属性之和大致相同。
+
+这个说法感觉对也不对，对的地方在于，确实会有上述的问题，不对的地方在于，这里的meshdrawcommand是经过排序处理的，并且是同一个pass的drawcall。会将使用同一个shader的command排在一起。提交command的配置应该是一致的，减少了RHICommandList转换和执行的负载，所以同一个group下，组内命令提交时间应该是大部分相似的（如果种类太多，排序太乱除外）。
+
+`FMeshDrawCommand::SubmitDraw`还有间接渲染的办法。
+
+#### 总结
+
+
 
 ###  从RHICommandList到GPU
 
@@ -1174,15 +1465,70 @@ RHICommandList负责收录与图形API无关的中间层绘制指令和数据。
 
 RHICommandList收录了一系列中间绘制指令之后，会在RHI线程一一转换到对应目标图形API的接口。
 
-这部分倒是没啥好说的
+这部分倒是没啥好说的调用的函数都是具体的绘制函数。
+
+```c++
+void FMeshDrawCommand::SubmitDrawEnd(const FMeshDrawCommand& MeshDrawCommand, uint32 InstanceFactor, FRHICommandList& RHICmdList,
+	FRHIBuffer* IndirectArgsOverrideBuffer,
+	uint32 IndirectArgsOverrideByteOffset)
+{
+	const bool bDoOverrideArgs = IndirectArgsOverrideBuffer != nullptr && MeshDrawCommand.PrimitiveIdStreamIndex >= 0;
+
+	if (MeshDrawCommand.IndexBuffer)
+	{	
+		if (MeshDrawCommand.NumPrimitives > 0 && !bDoOverrideArgs)
+		{
+			RHICmdList.DrawIndexedPrimitive(
+				MeshDrawCommand.IndexBuffer,
+				MeshDrawCommand.VertexParams.BaseVertexIndex,
+				0,
+				MeshDrawCommand.VertexParams.NumVertices,
+				MeshDrawCommand.FirstIndex,
+				MeshDrawCommand.NumPrimitives,
+				MeshDrawCommand.NumInstances * InstanceFactor
+			);
+		}
+		//......
+	}
+	//......
+}
+
+```
+
+这里的绘制需要最终转换为ri
+
+```c++
+//RHICommandList.h	
+FORCEINLINE_DEBUGGABLE void DrawIndexedPrimitive(FRHIBuffer* IndexBuffer, int32 BaseVertexIndex, uint32 FirstInstance, uint32 NumVertices, uint32 StartIndex, uint32 NumPrimitives, uint32 NumInstances)
+	{
+		//check(IsOutsideRenderPass());
+		if (Bypass())
+		{
+			GetContext().RHIDrawIndexedPrimitive(IndexBuffer, BaseVertexIndex, FirstInstance, NumVertices, StartIndex, NumPrimitives, NumInstances);
+			return;
+		}
+		ALLOC_COMMAND(FRHICommandDrawIndexedPrimitive)(IndexBuffer, BaseVertexIndex, FirstInstance, NumVertices, StartIndex, NumPrimitives, NumInstances);
+	}
+```
+
+这里的Context则是包括了不同种类的rhi
+
+```c++
+//RHIContext.h
+virtual void RHIDrawIndexedPrimitive(FRHIBuffer* IndexBuffer, int32 BaseVertexIndex, uint32 FirstInstance, uint32 NumVertices, uint32 StartIndex, uint32 NumPrimitives, uint32 NumInstances) = 0;
+```
+
+ue目前支持dx11,dx12,vk,opengl,
+
+#### 总结
+
+这部分没啥好说的，多平台支持。
 
 
 
 ### 静态和动态绘制路径
 
 根据前面的图片，UE存在2种网格绘制路径（橙色为每帧动态生成，蓝色为只生成一次后缓存）：第1种是动态绘制路径，从FPrimitiveSceneProxy到RHICommandList每帧都会动态创建，效率最低，但可控性最强；第2种是需要View的静态路径，可以缓存FMeshBatch数据，效率中，可控性中。根据看到的博客里面说有三种，但是最新的文档里没有，我估计是删了
-
-静态绘制路径的缓存数据只需要生成一次，所以可以减少渲染线程执行时间，提升运行效率。
 
 诸如静态网格，通过实现DrawStaticElements接口注入FStaticMeshBatch，而DrawStaticElements通常是SceneProxy加入场景时被调用的。（待确认）
 
@@ -1202,29 +1548,434 @@ FParallelMeshDrawCommandPass是通用的网格Pass，建议只用于性能较关
 
 ```
 
+a
 
 
-静态绘制路径通常可以被缓存，所以也叫缓存绘制路径，适用的对象可以是静态模型
 
-静态模型在其对应的FPrimitiveSceneInfo在调用AddToScene时，被执行缓存处理
 
-`PrimitiveSceneInfo.cpp`
 
-```C++
+静态绘制路径的缓存数据只需要生成一次，所以可以减少渲染线程执行时间，提升运行效率。
+
+```c++
+void FPrimitiveSceneInfo::AddToScene(FScene* Scene, TArrayView<FPrimitiveSceneInfo*> SceneInfos)
+{
+	check(IsInRenderingThread());
+	SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_AddToScene, FColor::Turquoise);
+
+	{
+		SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_AddToScene_IndirectLightingCacheUniformBuffer, FColor::Turquoise);
+		for (FPrimitiveSceneInfo* SceneInfo : SceneInfos)
+		{
+			FPrimitiveSceneProxy* Proxy = SceneInfo->Proxy;
+			// Create an indirect lighting cache uniform buffer if we attaching a primitive that may require it, as it may be stored inside a cached mesh command.
+			if (IsIndirectLightingCacheAllowed(Scene->GetFeatureLevel())
+				&& Proxy->WillEverBeLit()
+				&& ((Proxy->HasStaticLighting() && Proxy->NeedsUnbuiltPreviewLighting()) || (Proxy->IsMovable() && Proxy->GetIndirectLightingCacheQuality() != ILCQ_Off) || Proxy->GetLightmapType() == ELightmapType::ForceVolumetric))
+			{
+				if (!SceneInfo->IndirectLightingCacheUniformBuffer)
+				{
+					FIndirectLightingCacheUniformParameters Parameters;
+
+					GetIndirectLightingCacheParameters(
+						Scene->GetFeatureLevel(),
+						Parameters,
+						nullptr,
+						nullptr,
+						FVector(0.0f, 0.0f, 0.0f),
+						0,
+						nullptr);
+
+					SceneInfo->IndirectLightingCacheUniformBuffer = TUniformBufferRef<FIndirectLightingCacheUniformParameters>::CreateUniformBufferImmediate(Parameters, UniformBuffer_MultiFrame, EUniformBufferValidation::None);
+				}
+			}
+
+			SceneInfo->bPendingAddToScene = false;
+		}
+	}
+
+	{
+		SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_AddToScene_IndirectLightingCacheAllocation, FColor::Orange);
+		for (FPrimitiveSceneInfo* SceneInfo : SceneInfos)
+		{
+			FPrimitiveSceneProxy* Proxy = SceneInfo->Proxy;
+			// If we are attaching a primitive that should be statically lit but has unbuilt lighting,
+			// Allocate space in the indirect lighting cache so that it can be used for previewing indirect lighting
+			if (Proxy->HasStaticLighting()
+				&& Proxy->NeedsUnbuiltPreviewLighting()
+				&& IsIndirectLightingCacheAllowed(Scene->GetFeatureLevel()))
+			{
+				FIndirectLightingCacheAllocation* PrimitiveAllocation = Scene->IndirectLightingCache.FindPrimitiveAllocation(SceneInfo->PrimitiveComponentId);
+
+				if (PrimitiveAllocation)
+				{
+					SceneInfo->IndirectLightingCacheAllocation = PrimitiveAllocation;
+					PrimitiveAllocation->SetDirty();
+				}
+				else
+				{
+					PrimitiveAllocation = Scene->IndirectLightingCache.AllocatePrimitive(SceneInfo, true);
+					PrimitiveAllocation->SetDirty();
+					SceneInfo->IndirectLightingCacheAllocation = PrimitiveAllocation;
+				}
+			}
+			SceneInfo->MarkIndirectLightingCacheBufferDirty();
+		}
+	}
+
+	{
+		SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_AddToScene_LightmapDataOffset, FColor::Green);
+		for (FPrimitiveSceneInfo* SceneInfo : SceneInfos)
+		{
+			const bool bAllowStaticLighting = FReadOnlyCVARCache::Get().bAllowStaticLighting;
+			if (bAllowStaticLighting)
+			{
+				SceneInfo->NumLightmapDataEntries = SceneInfo->UpdateStaticLightingBuffer();
+				if (SceneInfo->NumLightmapDataEntries > 0 && UseGPUScene(GMaxRHIShaderPlatform, Scene->GetFeatureLevel()))
+				{
+					SceneInfo->LightmapDataOffset = Scene->GPUScene.LightmapDataAllocator.Allocate(SceneInfo->NumLightmapDataEntries);
+				}
+			}
+		}
+	}
+
+
+	{
+		SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_AddToScene_ReflectionCaptures, FColor::Yellow);
+		for (FPrimitiveSceneInfo* SceneInfo : SceneInfos)
+		{
+			// Cache the nearest reflection proxy if needed
+			if (SceneInfo->NeedsReflectionCaptureUpdate())
+			{
+				SceneInfo->CacheReflectionCaptures();
+			}
+		}
+	}
+
+	{
+		SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_AddToScene_AddToPrimitiveOctree, FColor::Red);
+		for (FPrimitiveSceneInfo* SceneInfo : SceneInfos)
+		{
+			// create potential storage for our compact info
+			FPrimitiveSceneInfoCompact CompactPrimitiveSceneInfo(SceneInfo);
+
+			// Add the primitive to the octree.
+			check(!SceneInfo->OctreeId.IsValidId());
+			Scene->PrimitiveOctree.AddElement(CompactPrimitiveSceneInfo);
+			check(SceneInfo->OctreeId.IsValidId());
+		}
+	}
+
+	{
+		SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_AddToScene_UpdateBounds, FColor::Cyan);
+		for (FPrimitiveSceneInfo* SceneInfo : SceneInfos)
+		{
+			FPrimitiveSceneProxy* Proxy = SceneInfo->Proxy;
+			int32 PackedIndex = SceneInfo->PackedIndex;
+
+			if (Proxy->CastsDynamicIndirectShadow())
+			{
+				Scene->DynamicIndirectCasterPrimitives.Add(SceneInfo);
+			}
+
+			Scene->PrimitiveSceneProxies[PackedIndex] = Proxy;
+			Scene->PrimitiveTransforms[PackedIndex] = Proxy->GetLocalToWorld();
+
+			// Set bounds.
+			FPrimitiveBounds& PrimitiveBounds = Scene->PrimitiveBounds[PackedIndex];
+			FBoxSphereBounds BoxSphereBounds = Proxy->GetBounds();
+			PrimitiveBounds.BoxSphereBounds = BoxSphereBounds;
+			PrimitiveBounds.MinDrawDistance = Proxy->GetMinDrawDistance();
+			PrimitiveBounds.MaxDrawDistance = Proxy->GetMaxDrawDistance();
+			PrimitiveBounds.MaxCullDistance = PrimitiveBounds.MaxDrawDistance;
+
+			Scene->PrimitiveFlagsCompact[PackedIndex] = FPrimitiveFlagsCompact(Proxy);
+
+			// Store precomputed visibility ID.
+			int32 VisibilityBitIndex = Proxy->GetVisibilityId();
+			FPrimitiveVisibilityId& VisibilityId = Scene->PrimitiveVisibilityIds[PackedIndex];
+			VisibilityId.ByteIndex = VisibilityBitIndex / 8;
+			VisibilityId.BitMask = (1 << (VisibilityBitIndex & 0x7));
+
+			// Store occlusion flags.
+			uint8 OcclusionFlags = EOcclusionFlags::None;
+			if (Proxy->CanBeOccluded())
+			{
+				OcclusionFlags |= EOcclusionFlags::CanBeOccluded;
+			}
+			if (Proxy->HasSubprimitiveOcclusionQueries())
+			{
+				OcclusionFlags |= EOcclusionFlags::HasSubprimitiveQueries;
+			}
+			if (Proxy->AllowApproximateOcclusion()
+				// Allow approximate occlusion if attached, even if the parent does not have bLightAttachmentsAsGroup enabled
+				|| SceneInfo->LightingAttachmentRoot.IsValid())
+			{
+				OcclusionFlags |= EOcclusionFlags::AllowApproximateOcclusion;
+			}
+			if (VisibilityBitIndex >= 0)
+			{
+				OcclusionFlags |= EOcclusionFlags::HasPrecomputedVisibility;
+			}
+			Scene->PrimitiveOcclusionFlags[PackedIndex] = OcclusionFlags;
+
+			// Store occlusion bounds.
+			FBoxSphereBounds OcclusionBounds = BoxSphereBounds;
+			if (Proxy->HasCustomOcclusionBounds())
+			{
+				OcclusionBounds = Proxy->GetCustomOcclusionBounds();
+			}
+			OcclusionBounds.BoxExtent.X = OcclusionBounds.BoxExtent.X + OCCLUSION_SLOP;
+			OcclusionBounds.BoxExtent.Y = OcclusionBounds.BoxExtent.Y + OCCLUSION_SLOP;
+			OcclusionBounds.BoxExtent.Z = OcclusionBounds.BoxExtent.Z + OCCLUSION_SLOP;
+			OcclusionBounds.SphereRadius = OcclusionBounds.SphereRadius + OCCLUSION_SLOP;
+			Scene->PrimitiveOcclusionBounds[PackedIndex] = OcclusionBounds;
+
+			// Store the component.
+			Scene->PrimitiveComponentIds[PackedIndex] = SceneInfo->PrimitiveComponentId;
+
+#if RHI_RAYTRACING
+			// Set group id
+			const int32 RayTracingGroupId = SceneInfo->Proxy->GetRayTracingGroupId();
+			if (RayTracingGroupId != -1)
+			{
+				Scene->PrimitiveRayTracingGroupIds[PackedIndex] = Scene->PrimitiveRayTracingGroups.FindId(RayTracingGroupId);
+			}
+#endif
+
+			INC_MEMORY_STAT_BY(STAT_PrimitiveInfoMemory, sizeof(*SceneInfo) + SceneInfo->StaticMeshes.GetAllocatedSize() + SceneInfo->StaticMeshRelevances.GetAllocatedSize() + Proxy->GetMemoryFootprint());
+		}
+	}
+
+	{
+		SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_AddToScene_LevelNotifyPrimitives, FColor::Blue);
+		for (FPrimitiveSceneInfo* SceneInfo : SceneInfos)
+		{
+			if (SceneInfo->Proxy->ShouldNotifyOnWorldAddRemove())
+			{
+				TArray<FPrimitiveSceneInfo*>& LevelNotifyPrimitives = Scene->PrimitivesNeedingLevelUpdateNotification.FindOrAdd(SceneInfo->Proxy->GetLevelName());
+				SceneInfo->LevelUpdateNotificationIndex = LevelNotifyPrimitives.Num();
+				LevelNotifyPrimitives.Add(SceneInfo);
+			}
+		}
+	}
+}
+
 ```
 
 静态网格在加入场景时就会缓存FMeshBatch，并且可能缓存对应的FMeshDrawCommand。其中判断是否支持缓存FMeshDrawCommand的关键接口是SupportsCachingMeshDrawCommands，它的实现如下
 
 ```c++
+bool SupportsCachingMeshDrawCommands(const FMeshBatch& MeshBatch)
+{
+	return
+		// Cached mesh commands only allow for a single mesh element per batch.
+		(MeshBatch.Elements.Num() == 1) &&
+
+		// View dependent arguments can't be cached
+		(MeshBatch.bViewDependentArguments == 0) &&
+
+		// Vertex factory needs to support caching.
+		MeshBatch.VertexFactory->GetType()->SupportsCachingMeshDrawCommands();
+}
 ```
 
-由此可见，决定是否可以缓存FMeshDrawCommand的条件是FMeshBatch只有一个元素,且该绘制不能有依赖View的参数，且其使用的顶点工厂支持缓存。
+调用RequestStaticMeshUpdate函数可以使缓存无效并进行更新
 
-只要任何一个条件不满足，则无法缓存FMeshDrawCommand。更详细地说，需要满足以下条件：
+使缓存无效会影响渲染性能，可选的替代方案是将可变的数据放到该Pass的UniformBuffer，通过UniformBuffer去执行不同的shader逻辑，以分离对基于view的shader绑定的依赖。
+
+与动态绘制路径不一样的是，在收集静态网格元素时，调用的是FPrimitiveSceneProxy::DrawStaticElements接口
+
+例如
+
+```c++
+virtual void DrawStaticElements(FStaticPrimitiveDrawInterface* PDI) override
+	{
+		if (!HasViewDependentDPG())
+		{
+			// Determine the DPG the primitive should be drawn in.
+			ESceneDepthPriorityGroup PrimitiveDPG = GetStaticDepthPriorityGroup();
+
+			PDI->ReserveMemoryForMeshes(Elements.Num());
+
+			for (int32 ElementIndex = 0;ElementIndex < Elements.Num();ElementIndex++)
+			{
+				const FModelElement& ModelElement = Component->GetElements()[ElementIndex];
+				if (ModelElement.NumTriangles > 0)
+				{
+					FMeshBatch MeshElement;
+					FMeshBatchElement& BatchElement = MeshElement.Elements[0];
+					BatchElement.IndexBuffer = ModelElement.IndexBuffer;
+					MeshElement.VertexFactory = &VertexFactory;
+					MeshElement.MaterialRenderProxy = Elements[ElementIndex].GetMaterial()->GetRenderProxy();
+					MeshElement.LCI = &Elements[ElementIndex];
+					BatchElement.FirstIndex = ModelElement.FirstIndex;
+					BatchElement.NumPrimitives = ModelElement.NumTriangles;
+					BatchElement.MinVertexIndex = ModelElement.MinVertexIndex;
+					BatchElement.MaxVertexIndex = ModelElement.MaxVertexIndex;
+					BatchElement.VertexFactoryUserData = Elements[ElementIndex].GetVertexFactoryUniformBuffer();
+					MeshElement.Type = PT_TriangleList;
+					MeshElement.DepthPriorityGroup = (uint8)PrimitiveDPG;
+					MeshElement.LODIndex = 0;
+					const bool bValidIndexBuffer = !BatchElement.IndexBuffer || (BatchElement.IndexBuffer && BatchElement.IndexBuffer->IsInitialized() && BatchElement.IndexBuffer->IndexBufferRHI);
+					ensure(bValidIndexBuffer);
+					if (bValidIndexBuffer)
+					{
+						PDI->DrawMesh(MeshElement, FLT_MAX);
+					}
+				}
+			}
+		}
+	}
+```
+
+由此可见，DrawStaticElements接口会传入FStaticPrimitiveDrawInterface的实例，以收集该PrimitiveSceneProxy的所有静态元素
+
+```C++
+class FBatchingSPDI : public FStaticPrimitiveDrawInterface
+{
+public:
+
+	// Constructor.
+	FBatchingSPDI(FPrimitiveSceneInfo* InPrimitiveSceneInfo):
+		PrimitiveSceneInfo(InPrimitiveSceneInfo)
+	{}
+
+	// FStaticPrimitiveDrawInterface.
+	virtual void SetHitProxy(HHitProxy* HitProxy) final override
+	{
+		CurrentHitProxy = HitProxy;
+
+		if(HitProxy)
+		{
+			// Only use static scene primitive hit proxies in the editor.
+			if(GIsEditor)
+			{
+				// Keep a reference to the hit proxy from the FPrimitiveSceneInfo, to ensure it isn't deleted while the static mesh still
+				// uses its id.
+				PrimitiveSceneInfo->HitProxies.Add(HitProxy);
+			}
+		}
+	}
+
+	virtual void ReserveMemoryForMeshes(int32 MeshNum)
+	{
+		PrimitiveSceneInfo->StaticMeshRelevances.Reserve(PrimitiveSceneInfo->StaticMeshRelevances.Num() + MeshNum);
+		PrimitiveSceneInfo->StaticMeshes.Reserve(PrimitiveSceneInfo->StaticMeshes.Num() + MeshNum);
+	}
+
+	virtual void DrawMesh(const FMeshBatch& Mesh, float ScreenSize) final override
+	{
+		if (Mesh.HasAnyDrawCalls())
+		{
+			checkSlow(IsInParallelRenderingThread());
+
+			FPrimitiveSceneProxy* PrimitiveSceneProxy = PrimitiveSceneInfo->Proxy;
+			const ERHIFeatureLevel::Type FeatureLevel = PrimitiveSceneInfo->Scene->GetFeatureLevel();
+
+			if (!Mesh.Validate(PrimitiveSceneProxy, FeatureLevel))
+			{
+				return;
+			}
+
+			FStaticMeshBatch* StaticMesh = new(PrimitiveSceneInfo->StaticMeshes) FStaticMeshBatch(
+				PrimitiveSceneInfo,
+				Mesh,
+				CurrentHitProxy ? CurrentHitProxy->Id : FHitProxyId()
+			);
+
+			StaticMesh->PreparePrimitiveUniformBuffer(PrimitiveSceneProxy, FeatureLevel);
+			// Volumetric self shadow mesh commands need to be generated every frame, as they depend on single frame uniform buffers with self shadow data.
+			const bool bSupportsCachingMeshDrawCommands = SupportsCachingMeshDrawCommands(*StaticMesh, FeatureLevel) && !PrimitiveSceneProxy->CastsVolumetricTranslucentShadow();
+
+			const FMaterial& Material = Mesh.MaterialRenderProxy->GetIncompleteMaterialWithFallback(FeatureLevel);
+			bool bUseSkyMaterial = Material.IsSky();
+			bool bUseSingleLayerWaterMaterial = Material.GetShadingModels().HasShadingModel(MSM_SingleLayerWater);
+			bool bUseAnisotropy = Material.GetShadingModels().HasAnyShadingModel({MSM_DefaultLit, MSM_ClearCoat}) && Material.MaterialUsesAnisotropy_RenderThread();
+			bool bSupportsNaniteRendering = SupportsNaniteRendering(StaticMesh->VertexFactory, PrimitiveSceneProxy, Mesh.MaterialRenderProxy, FeatureLevel);
+			bool bSupportsGPUScene = StaticMesh->VertexFactory->SupportsGPUScene(FeatureLevel);
+
+			FStaticMeshBatchRelevance* StaticMeshRelevance = new(PrimitiveSceneInfo->StaticMeshRelevances) FStaticMeshBatchRelevance(
+				*StaticMesh, 
+				ScreenSize, 
+				bSupportsCachingMeshDrawCommands,
+				bUseSkyMaterial,
+				bUseSingleLayerWaterMaterial,
+				bUseAnisotropy,
+				bSupportsNaniteRendering,
+				bSupportsGPUScene,
+				FeatureLevel
+				);
+		}
+	}
+}
+```
 
 
+
+FBatchingSPDI::DrawMesh最主要作用是将PrimitiveSceneProxy转换成FStaticMeshBatch，然后处理网格的Relevance数据。
 
 ### 总结
+
+前面章节已经详细阐述了UE是如何将图元从Component一步步地转成最终的绘制指令，这样做的目的主要是为了提升渲染性能，总结起来，涉及的优化技术主要有以下几点：
+
+- **绘制调用合并**
+
+由于所有的`FMeshDrawCommands` 都是事先捕获，而不是立即提交给GPU，这就给Draw Call合并提供了有利的基础保障。不过目前版本的合并是基于D3D11的特性，根据shader绑定决定是否合并成同一个instance调用。基于D3D12的聚合合并目前尚未实现。
+
+除了合并，排序也能使得相似的指令在相邻时间绘制，提升CPU和GPU的缓存命中，减少调用指令数量。
+
+- **动态实例化**
+
+为了合并两个Draw Call，它们必须拥有一致的shader绑定（`FMeshDrawCommand::MatchesForDynamicInstancing`返回true）。
+
+当前只有缓存的网格绘制命令才会被动态实例化，并且受`FLocalVertexFactory`是否支持缓存的限制。另外，有一些特殊的情况也会阻止合并：
+
+- Lightmap产生了很小的纹理（可调整`DefaultEngine.ini`的**MaxLightmapRadius** 参数）。
+
+- 逐组件的顶点颜色。
+- SpeedTree带风节点。
+
+使用控制台命令**r.MeshDrawCommands.LogDynamicInstancingStats 1**可探查动态实例的效益。
+
+- **并行绘制**
+
+大多数的网格绘制任务不是在渲染线程中执行的，而是由TaskGraph系统并行触发。并行部分有Pass的Content设置，动态指令生成/排序/合并等。
+
+并行的数量由运行设备的CPU核心数量决定，并行开启之后，存在Join阶段，以等待并行的所有线程都执行完毕（`FSceneRenderer::WaitForTasksClearSnapshotsAndDeleteSceneRenderer`开启并行绘制等待）。
+
+- **缓存绘制指令**
+
+UE为了提升缓存的比例和效率，分离了动态和静态物体的绘制，分别形成动态绘制路径和静态绘制路径，而静态绘制路径可以在图元加入场景时就缓存FMeshBatch和FMeshDrawCommand，这样就达成了一次生成多次绘制带来的高效益。
+
+- **提升缓存命中率**
+
+CPU或GPU的缓存都具体时间局部性和空间局部性原则。时间局部性意味着最近访问的数据如果再次被访问，则缓存命中的概率较大；空间局部性意味着当前在处理的数据的相邻数据被缓存命中的概率较大，还包含预读取（prefetch）命中率。
+
+UE通过以下手段来提升缓存命中率：
+
+- 基于数据驱动的设计，而非面向对象的设计。
+
+  - 如FMeshDrawCommand的结构设计。
+
+- 连续存储数据。
+
+  - 使用TChunkedArray存储FMeshDrawCommand。
+
+- 内存对齐。
+
+  - 使用定制的内存对齐器和内存分配器。
+
+- 轻量化数据结构。
+
+- 连续存取数据。
+
+  - 连续遍历绘制指令。
+
+- 绘制指令排序。
+
+  - 使相似的指令排在一起，充分利用缓存的时间局部性。
+
+  
 
 - **绘制调用合并**
 - **动态实例化**
