@@ -808,6 +808,10 @@ void GenerateDynamicMeshDrawCommands(
 
 ```
 
+> 上面计算键值时数次用到了`CityHash64`，`CityHash64`是一种计算任意数量字符串哈希值的算法，是一个快速的非加密哈希函数，也是一种快速的非加密的散列函数。它的实现代码在Engine\Source\Runtime\Core\Private\Hash\CityHash.cpp中，有兴趣的童鞋自行研读了。
+>
+> 与之相似的哈希算法有：HalfMD5，MD5，SipHash64，SipHash128，IntHash32，IntHash64，SHA1，SHA224，SHA256等等。
+
 
 
 前文中我们说过，FMeshPassProcessor充当了将FMeshBatch转换成FMeshDrawCommands的角色。直接调用则是通过一个重载的AddMeshBatch函数
@@ -1015,10 +1019,7 @@ void FMeshPassProcessor::BuildMeshDrawCommands(
 	FGraphicsMinimalPipelineStateInitializer PipelineState;
 	PipelineState.PrimitiveType = (EPrimitiveType)MeshBatch.Type;
 	PipelineState.ImmutableSamplerState = MaterialRenderProxy.ImmutableSamplerState;
-
-	//.....
-    //pipelinestate object设置，MeshDrawCommand设置
-	//.....
+ 
 	
     //shader设置
 	int32 DataOffset = 0;
@@ -1536,229 +1537,106 @@ ue目前支持dx11,dx12,vk,opengl,
 
 FParallelMeshDrawCommandPass是通用的网格Pass，建议只用于性能较关键的网格Pass中，因为只支持并行和缓存渲染。如果要使用并行或缓存路径，必须经过严格的设计，因为在InitViews之后不能修改网格绘制命令和shader绑定的任何数据。
 
-例如
-
-```c++
-
-```
-
 除了FParallelMeshDrawCommandPass，还有一种更简单的调用绘制指令的方式：DrawDynamicMeshPass。DrawDynamicMeshPass只需要传入view/RHICommandList以及一个lambda匿名函数就可，它的声明及使用例子如下：
 
-```C++
-
-```
-
-a
-
-
-
-
-
-静态绘制路径的缓存数据只需要生成一次，所以可以减少渲染线程执行时间，提升运行效率。
+静态绘制路径的缓存数据只需要生成一次，所以可以减少渲染线程执行时间，提升运行效率。这其中AddStaticMeshed函数。这个函数会保存绘制命令。之前这个函数是在AddToScene中调用的，现在调整之后变成分开执行。每帧中，会执行UpdateAllPrimitiveSceneInfos来更新信息。UpdateAllPrimitiveSceneInfos是一个一千多行的函数。
 
 ```c++
-void FPrimitiveSceneInfo::AddToScene(FScene* Scene, TArrayView<FPrimitiveSceneInfo*> SceneInfos)
+void FScene::UpdateAllPrimitiveSceneInfos(FRDGBuilder& GraphBuilder, EUpdateAllPrimitiveSceneInfosAsyncOps AsyncOps)
 {
-	check(IsInRenderingThread());
-	SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_AddToScene, FColor::Turquoise);
+    //.....	
+	TArray<FPrimitiveSceneInfo*, SceneRenderingAllocator>& SceneInfosWithAddToScene = *GraphBuilder.AllocObject<TArray<FPrimitiveSceneInfo*, SceneRenderingAllocator>>();
+	TArray<FPrimitiveSceneInfo*, SceneRenderingAllocator> SceneInfosWithFlushVirtualTexture;
+	TArray<FPrimitiveSceneInfo*, SceneRenderingAllocator>& SceneInfosWithStaticDrawListUpdate = *GraphBuilder.AllocObject<TArray<FPrimitiveSceneInfo*, SceneRenderingAllocator>>();
+	SceneInfosWithAddToScene.Reserve(SceneInfosContainerReservedSize);
+	SceneInfosWithFlushVirtualTexture.Reserve(SceneInfosContainerReservedSize);
+	SceneInfosWithStaticDrawListUpdate.Reserve(SceneInfosContainerReservedSize);
+    //.....
+	const auto QueueAddStaticMeshes = [&](FPrimitiveSceneInfo* SceneInfo)
+	{
+		if (!SceneInfo->bPendingAddStaticMeshes)
+		{
+			SceneInfo->bPendingAddStaticMeshes = 1;
+			SceneInfosWithStaticDrawListUpdate.Push(SceneInfo);
+			PrimitivesNeedingStaticMeshUpdate[SceneInfo->PackedIndex] = false;
+			return true;
+		}
+		return false;
+	};
+    //.....
+	if (SceneInfosWithStaticDrawListUpdate.Num() > 0)
+	{
+		FPrimitiveSceneInfo::AddStaticMeshes(this, SceneInfosWithStaticDrawListUpdate, false);
+	}
+	
+    
+}
+
+void FPrimitiveSceneInfo::AddStaticMeshes(FScene* Scene, TArrayView<FPrimitiveSceneInfo*> SceneInfos, bool bCacheMeshDrawCommands)
+{
+	LLM_SCOPE(ELLMTag::StaticMesh);
 
 	{
-		SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_AddToScene_IndirectLightingCacheUniformBuffer, FColor::Turquoise);
+         // 并行处理静态图元。
+		ParallelForTemplate(SceneInfos.Num(), [Scene, &SceneInfos](int32 Index)
+		{
+			FOptionalTaskTagScope Scope(ETaskTag::EParallelRenderingThread);
+			SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_AddStaticMeshes_DrawStaticElements, FColor::Magenta);
+			FPrimitiveSceneInfo* SceneInfo = SceneInfos[Index];
+			// Cache the primitive's static mesh elements.
+			FBatchingSPDI BatchingSPDI(SceneInfo);
+			BatchingSPDI.SetHitProxy(SceneInfo->DefaultDynamicHitProxy);
+            // 调用Proxy的DrawStaticElements接口，将收集到的FStaticMeshBatch添加到SceneInfo->StaticMeshes中。
+			SceneInfo->Proxy->DrawStaticElements(&BatchingSPDI);
+			SceneInfo->StaticMeshes.Shrink();
+			SceneInfo->StaticMeshRelevances.Shrink();
+			SceneInfo->bPendingAddStaticMeshes = false;
+
+			check(SceneInfo->StaticMeshRelevances.Num() == SceneInfo->StaticMeshes.Num());
+		});
+	}
+
+	{
+		const ERHIFeatureLevel::Type FeatureLevel = Scene->GetFeatureLevel();
+		FRHICommandListBase& RHICmdList = FRHICommandListImmediate::Get();
+		 // 将所有PrimitiveSceneInfo的staticMeshBatch添加到场景的StaticMeshe列表。
+		SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_AddStaticMeshes_UpdateSceneArrays, FColor::Blue);
 		for (FPrimitiveSceneInfo* SceneInfo : SceneInfos)
 		{
-			FPrimitiveSceneProxy* Proxy = SceneInfo->Proxy;
-			// Create an indirect lighting cache uniform buffer if we attaching a primitive that may require it, as it may be stored inside a cached mesh command.
-			if (IsIndirectLightingCacheAllowed(Scene->GetFeatureLevel())
-				&& Proxy->WillEverBeLit()
-				&& ((Proxy->HasStaticLighting() && Proxy->NeedsUnbuiltPreviewLighting()) || (Proxy->IsMovable() && Proxy->GetIndirectLightingCacheQuality() != ILCQ_Off) || Proxy->GetLightmapType() == ELightmapType::ForceVolumetric))
+			// Allocate OIT index buffer where needed
+			const bool bAllocateSortedTriangles = OIT::IsEnabled(EOITSortingType::SortedTriangles, GMaxRHIShaderPlatform) && SceneInfo->Proxy->SupportsSortedTriangles();
+
+			for (int32 MeshIndex = 0; MeshIndex < SceneInfo->StaticMeshes.Num(); MeshIndex++)
 			{
-				if (!SceneInfo->IndirectLightingCacheUniformBuffer)
+				FStaticMeshBatchRelevance& MeshRelevance = SceneInfo->StaticMeshRelevances[MeshIndex];
+				FStaticMeshBatch& Mesh = SceneInfo->StaticMeshes[MeshIndex];
+
+				// Add the static mesh to the scene's static mesh list.
+				FSparseArrayAllocationInfo SceneArrayAllocation = Scene->StaticMeshes.AddUninitialized();
+				Scene->StaticMeshes[SceneArrayAllocation.Index] = &Mesh;
+				Mesh.Id = SceneArrayAllocation.Index;
+				MeshRelevance.Id = SceneArrayAllocation.Index;
+
+				if (bAllocateSortedTriangles && OIT::IsCompatible(Mesh, FeatureLevel))
 				{
-					FIndirectLightingCacheUniformParameters Parameters;
-
-					GetIndirectLightingCacheParameters(
-						Scene->GetFeatureLevel(),
-						Parameters,
-						nullptr,
-						nullptr,
-						FVector(0.0f, 0.0f, 0.0f),
-						0,
-						nullptr);
-
-					SceneInfo->IndirectLightingCacheUniformBuffer = TUniformBufferRef<FIndirectLightingCacheUniformParameters>::CreateUniformBufferImmediate(Parameters, UniformBuffer_MultiFrame, EUniformBufferValidation::None);
+					FSortedTriangleData Allocation = Scene->OITSceneData.Allocate(RHICmdList, Mesh.Elements[0].IndexBuffer, EPrimitiveType(Mesh.Type), Mesh.Elements[0].FirstIndex, Mesh.Elements[0].NumPrimitives);
+					OIT::ConvertSortedIndexToDynamicIndex(&Allocation, &Mesh.Elements[0].DynamicIndexBuffer);
 				}
 			}
-
-			SceneInfo->bPendingAddToScene = false;
 		}
 	}
 
-	{
-		SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_AddToScene_IndirectLightingCacheAllocation, FColor::Orange);
-		for (FPrimitiveSceneInfo* SceneInfo : SceneInfos)
-		{
-			FPrimitiveSceneProxy* Proxy = SceneInfo->Proxy;
-			// If we are attaching a primitive that should be statically lit but has unbuilt lighting,
-			// Allocate space in the indirect lighting cache so that it can be used for previewing indirect lighting
-			if (Proxy->HasStaticLighting()
-				&& Proxy->NeedsUnbuiltPreviewLighting()
-				&& IsIndirectLightingCacheAllowed(Scene->GetFeatureLevel()))
-			{
-				FIndirectLightingCacheAllocation* PrimitiveAllocation = Scene->IndirectLightingCache.FindPrimitiveAllocation(SceneInfo->PrimitiveComponentId);
-
-				if (PrimitiveAllocation)
-				{
-					SceneInfo->IndirectLightingCacheAllocation = PrimitiveAllocation;
-					PrimitiveAllocation->SetDirty();
-				}
-				else
-				{
-					PrimitiveAllocation = Scene->IndirectLightingCache.AllocatePrimitive(SceneInfo, true);
-					PrimitiveAllocation->SetDirty();
-					SceneInfo->IndirectLightingCacheAllocation = PrimitiveAllocation;
-				}
-			}
-			SceneInfo->MarkIndirectLightingCacheBufferDirty();
-		}
-	}
-
-	{
-		SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_AddToScene_LightmapDataOffset, FColor::Green);
-		for (FPrimitiveSceneInfo* SceneInfo : SceneInfos)
-		{
-			const bool bAllowStaticLighting = FReadOnlyCVARCache::Get().bAllowStaticLighting;
-			if (bAllowStaticLighting)
-			{
-				SceneInfo->NumLightmapDataEntries = SceneInfo->UpdateStaticLightingBuffer();
-				if (SceneInfo->NumLightmapDataEntries > 0 && UseGPUScene(GMaxRHIShaderPlatform, Scene->GetFeatureLevel()))
-				{
-					SceneInfo->LightmapDataOffset = Scene->GPUScene.LightmapDataAllocator.Allocate(SceneInfo->NumLightmapDataEntries);
-				}
-			}
-		}
-	}
-
-
-	{
-		SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_AddToScene_ReflectionCaptures, FColor::Yellow);
-		for (FPrimitiveSceneInfo* SceneInfo : SceneInfos)
-		{
-			// Cache the nearest reflection proxy if needed
-			if (SceneInfo->NeedsReflectionCaptureUpdate())
-			{
-				SceneInfo->CacheReflectionCaptures();
-			}
-		}
-	}
-
-	{
-		SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_AddToScene_AddToPrimitiveOctree, FColor::Red);
-		for (FPrimitiveSceneInfo* SceneInfo : SceneInfos)
-		{
-			// create potential storage for our compact info
-			FPrimitiveSceneInfoCompact CompactPrimitiveSceneInfo(SceneInfo);
-
-			// Add the primitive to the octree.
-			check(!SceneInfo->OctreeId.IsValidId());
-			Scene->PrimitiveOctree.AddElement(CompactPrimitiveSceneInfo);
-			check(SceneInfo->OctreeId.IsValidId());
-		}
-	}
-
-	{
-		SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_AddToScene_UpdateBounds, FColor::Cyan);
-		for (FPrimitiveSceneInfo* SceneInfo : SceneInfos)
-		{
-			FPrimitiveSceneProxy* Proxy = SceneInfo->Proxy;
-			int32 PackedIndex = SceneInfo->PackedIndex;
-
-			if (Proxy->CastsDynamicIndirectShadow())
-			{
-				Scene->DynamicIndirectCasterPrimitives.Add(SceneInfo);
-			}
-
-			Scene->PrimitiveSceneProxies[PackedIndex] = Proxy;
-			Scene->PrimitiveTransforms[PackedIndex] = Proxy->GetLocalToWorld();
-
-			// Set bounds.
-			FPrimitiveBounds& PrimitiveBounds = Scene->PrimitiveBounds[PackedIndex];
-			FBoxSphereBounds BoxSphereBounds = Proxy->GetBounds();
-			PrimitiveBounds.BoxSphereBounds = BoxSphereBounds;
-			PrimitiveBounds.MinDrawDistance = Proxy->GetMinDrawDistance();
-			PrimitiveBounds.MaxDrawDistance = Proxy->GetMaxDrawDistance();
-			PrimitiveBounds.MaxCullDistance = PrimitiveBounds.MaxDrawDistance;
-
-			Scene->PrimitiveFlagsCompact[PackedIndex] = FPrimitiveFlagsCompact(Proxy);
-
-			// Store precomputed visibility ID.
-			int32 VisibilityBitIndex = Proxy->GetVisibilityId();
-			FPrimitiveVisibilityId& VisibilityId = Scene->PrimitiveVisibilityIds[PackedIndex];
-			VisibilityId.ByteIndex = VisibilityBitIndex / 8;
-			VisibilityId.BitMask = (1 << (VisibilityBitIndex & 0x7));
-
-			// Store occlusion flags.
-			uint8 OcclusionFlags = EOcclusionFlags::None;
-			if (Proxy->CanBeOccluded())
-			{
-				OcclusionFlags |= EOcclusionFlags::CanBeOccluded;
-			}
-			if (Proxy->HasSubprimitiveOcclusionQueries())
-			{
-				OcclusionFlags |= EOcclusionFlags::HasSubprimitiveQueries;
-			}
-			if (Proxy->AllowApproximateOcclusion()
-				// Allow approximate occlusion if attached, even if the parent does not have bLightAttachmentsAsGroup enabled
-				|| SceneInfo->LightingAttachmentRoot.IsValid())
-			{
-				OcclusionFlags |= EOcclusionFlags::AllowApproximateOcclusion;
-			}
-			if (VisibilityBitIndex >= 0)
-			{
-				OcclusionFlags |= EOcclusionFlags::HasPrecomputedVisibility;
-			}
-			Scene->PrimitiveOcclusionFlags[PackedIndex] = OcclusionFlags;
-
-			// Store occlusion bounds.
-			FBoxSphereBounds OcclusionBounds = BoxSphereBounds;
-			if (Proxy->HasCustomOcclusionBounds())
-			{
-				OcclusionBounds = Proxy->GetCustomOcclusionBounds();
-			}
-			OcclusionBounds.BoxExtent.X = OcclusionBounds.BoxExtent.X + OCCLUSION_SLOP;
-			OcclusionBounds.BoxExtent.Y = OcclusionBounds.BoxExtent.Y + OCCLUSION_SLOP;
-			OcclusionBounds.BoxExtent.Z = OcclusionBounds.BoxExtent.Z + OCCLUSION_SLOP;
-			OcclusionBounds.SphereRadius = OcclusionBounds.SphereRadius + OCCLUSION_SLOP;
-			Scene->PrimitiveOcclusionBounds[PackedIndex] = OcclusionBounds;
-
-			// Store the component.
-			Scene->PrimitiveComponentIds[PackedIndex] = SceneInfo->PrimitiveComponentId;
-
-#if RHI_RAYTRACING
-			// Set group id
-			const int32 RayTracingGroupId = SceneInfo->Proxy->GetRayTracingGroupId();
-			if (RayTracingGroupId != -1)
-			{
-				Scene->PrimitiveRayTracingGroupIds[PackedIndex] = Scene->PrimitiveRayTracingGroups.FindId(RayTracingGroupId);
-			}
-#endif
-
-			INC_MEMORY_STAT_BY(STAT_PrimitiveInfoMemory, sizeof(*SceneInfo) + SceneInfo->StaticMeshes.GetAllocatedSize() + SceneInfo->StaticMeshRelevances.GetAllocatedSize() + Proxy->GetMemoryFootprint());
-		}
-	}
-
-	{
-		SCOPED_NAMED_EVENT(FPrimitiveSceneInfo_AddToScene_LevelNotifyPrimitives, FColor::Blue);
-		for (FPrimitiveSceneInfo* SceneInfo : SceneInfos)
-		{
-			if (SceneInfo->Proxy->ShouldNotifyOnWorldAddRemove())
-			{
-				TArray<FPrimitiveSceneInfo*>& LevelNotifyPrimitives = Scene->PrimitivesNeedingLevelUpdateNotification.FindOrAdd(SceneInfo->Proxy->GetLevelName());
-				SceneInfo->LevelUpdateNotificationIndex = LevelNotifyPrimitives.Num();
-				LevelNotifyPrimitives.Add(SceneInfo);
-			}
-		}
+	if (bCacheMeshDrawCommands)
+	{	
+        //缓存
+		CacheMeshDrawCommands(Scene, SceneInfos);
+		CacheNaniteDrawCommands(Scene, SceneInfos);
+	#if RHI_RAYTRACING
+		CacheRayTracingPrimitives(Scene, SceneInfos);
+	#endif
 	}
 }
+
 
 ```
 
@@ -1834,34 +1712,7 @@ virtual void DrawStaticElements(FStaticPrimitiveDrawInterface* PDI) override
 class FBatchingSPDI : public FStaticPrimitiveDrawInterface
 {
 public:
-
-	// Constructor.
-	FBatchingSPDI(FPrimitiveSceneInfo* InPrimitiveSceneInfo):
-		PrimitiveSceneInfo(InPrimitiveSceneInfo)
-	{}
-
-	// FStaticPrimitiveDrawInterface.
-	virtual void SetHitProxy(HHitProxy* HitProxy) final override
-	{
-		CurrentHitProxy = HitProxy;
-
-		if(HitProxy)
-		{
-			// Only use static scene primitive hit proxies in the editor.
-			if(GIsEditor)
-			{
-				// Keep a reference to the hit proxy from the FPrimitiveSceneInfo, to ensure it isn't deleted while the static mesh still
-				// uses its id.
-				PrimitiveSceneInfo->HitProxies.Add(HitProxy);
-			}
-		}
-	}
-
-	virtual void ReserveMemoryForMeshes(int32 MeshNum)
-	{
-		PrimitiveSceneInfo->StaticMeshRelevances.Reserve(PrimitiveSceneInfo->StaticMeshRelevances.Num() + MeshNum);
-		PrimitiveSceneInfo->StaticMeshes.Reserve(PrimitiveSceneInfo->StaticMeshes.Num() + MeshNum);
-	}
+	//......
 
 	virtual void DrawMesh(const FMeshBatch& Mesh, float ScreenSize) final override
 	{
@@ -1876,7 +1727,7 @@ public:
 			{
 				return;
 			}
-
+			// 创建新的FStaticMeshBatch实例，且加入到PrimitiveSceneInfo的StaticMeshe列表中。
 			FStaticMeshBatch* StaticMesh = new(PrimitiveSceneInfo->StaticMeshes) FStaticMeshBatch(
 				PrimitiveSceneInfo,
 				Mesh,
@@ -1973,15 +1824,4 @@ UE通过以下手段来提升缓存命中率：
 
 - 绘制指令排序。
 
-  - 使相似的指令排在一起，充分利用缓存的时间局部性。
-
-  
-
-- **绘制调用合并**
-- **动态实例化**
-
-- **并行绘制**
-
-- **缓存绘制指令**
-
-- **提升缓存命中率**
+  - 使相似的指令排在一起，充分利用缓存的时间局部性
